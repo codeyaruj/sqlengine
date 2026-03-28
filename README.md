@@ -1,3 +1,5 @@
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 # ⚙️ Mini SQL Engine in C
 
 A lightweight, modular SQL database engine built from scratch in C.
