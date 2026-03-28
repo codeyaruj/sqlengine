@@ -1,0 +1,11 @@
+# Build output
+sqlengine
+obj/
+
+# Data files
+*.tbl
+*.idx
+
+# OS files
+.DS_Store
+*.swp
