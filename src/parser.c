@@ -1,144 +1,247 @@
 #include "parser.h"
+#include "util.h"
+
 #include <string.h>
-#include <stdlib.h>
 
-static int peek(Token* tokens, int pos, TokenType expected) {
-    return tokens[pos].type == expected;
+void parser_init(Parser *p, const Token *tokens, size_t count) {
+    p->tokens = tokens;
+    p->count = count;
+    p->pos = 0;
 }
 
-static int expect(Token* tokens, int* pos, TokenType expected) {
-    if (tokens[*pos].type == expected) {
-        (*pos)++;
-        return 1;
+bool parser_at_end(const Parser *p) {
+    if (p == NULL || p->tokens == NULL || p->count == 0) {
+        return true;
     }
-    return 0;
+    if (p->pos >= p->count) {
+        return true;
+    }
+    return p->tokens[p->pos].type == TOKEN_EOF;
 }
 
-static int parse_select(Token* tokens, int* pos, int token_count, AST* ast) {
-    int start = *pos;
-    (void)start;
-    
-    SelectQuery* sel = &ast->query.select;
+const Token *parser_peek(const Parser *p) {
+    static const Token eof_token = { TOKEN_EOF, "" };
+    if (p == NULL || p->tokens == NULL || p->count == 0) {
+        return &eof_token;
+    }
+    if (p->pos >= p->count) {
+        return &eof_token;
+    }
+    return &p->tokens[p->pos];
+}
+
+const Token *parser_previous(const Parser *p) {
+    static const Token eof_token = { TOKEN_EOF, "" };
+    if (p == NULL || p->tokens == NULL || p->count == 0 || p->pos == 0) {
+        return &eof_token;
+    }
+    return &p->tokens[p->pos - 1];
+}
+
+const Token *parser_advance(Parser *p) {
+    const Token *cur = parser_peek(p);
+    if (!parser_at_end(p) && p->pos < p->count) {
+        p->pos++;
+    }
+    return cur;
+}
+
+bool parser_check(const Parser *p, TokenType type) {
+    return parser_peek(p)->type == type;
+}
+
+bool parser_match(Parser *p, TokenType type) {
+    if (parser_check(p, type)) {
+        parser_advance(p);
+        return true;
+    }
+    return false;
+}
+
+bool parser_expect(Parser *p, TokenType type) {
+    if (parser_check(p, type)) {
+        parser_advance(p);
+        return true;
+    }
+    return false;
+}
+
+static ParseStatus parse_select(Parser *p, AST *ast) {
+    SelectQuery *sel = &ast->query.select;
+
     sel->select_all = 0;
     sel->column_count = 0;
     sel->has_where = 0;
     sel->table_name[0] = '\0';
     sel->where_column[0] = '\0';
     sel->where_value[0] = '\0';
-    
-    if (!expect(tokens, pos, TOKEN_SELECT)) return -1;
-    
-    if (peek(tokens, *pos, TOKEN_STAR)) {
-        sel->select_all = 1;
-        (*pos)++;
+    sel->where_value_type = LITERAL_NUMBER;
+
+    if (!parser_expect(p, TOKEN_SELECT)) {
+        return PARSE_ERROR;
     }
-    else if (peek(tokens, *pos, TOKEN_IDENTIFIER)) {
+
+    if (parser_match(p, TOKEN_STAR)) {
+        sel->select_all = 1;
+    } else if (parser_check(p, TOKEN_IDENTIFIER)) {
         sel->select_all = 0;
-        strncpy(sel->columns[0], tokens[*pos].value, 31);
+        strncpy(sel->columns[0], parser_peek(p)->value, 31);
         sel->columns[0][31] = '\0';
         sel->column_count = 1;
-        (*pos)++;
-        
-        while (peek(tokens, *pos, TOKEN_COMMA)) {
-            (*pos)++;
-            if (!peek(tokens, *pos, TOKEN_IDENTIFIER)) return -1;
-            if (sel->column_count >= MAX_COLUMNS) return -1;
-            strncpy(sel->columns[sel->column_count], tokens[*pos].value, 31);
+        parser_advance(p);
+
+        while (parser_match(p, TOKEN_COMMA)) {
+            if (!parser_check(p, TOKEN_IDENTIFIER)) {
+                return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+            }
+            if (sel->column_count >= MAX_COLUMNS) {
+                return PARSE_ERROR;
+            }
+            strncpy(sel->columns[sel->column_count], parser_peek(p)->value, 31);
             sel->columns[sel->column_count][31] = '\0';
             sel->column_count++;
-            (*pos)++;
+            parser_advance(p);
         }
+    } else {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
     }
-    else {
-        return -1;
+
+    if (!parser_expect(p, TOKEN_FROM)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
     }
-    
-    if (!expect(tokens, pos, TOKEN_FROM)) return -1;
-    
-    if (!peek(tokens, *pos, TOKEN_IDENTIFIER)) return -1;
-    strncpy(sel->table_name, tokens[*pos].value, 31);
+
+    if (!parser_check(p, TOKEN_IDENTIFIER)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+    strncpy(sel->table_name, parser_peek(p)->value, 31);
     sel->table_name[31] = '\0';
-    (*pos)++;
-    
-    if (peek(tokens, *pos, TOKEN_WHERE)) {
-        (*pos)++;
+    parser_advance(p);
+
+    if (parser_match(p, TOKEN_WHERE)) {
         sel->has_where = 1;
-        
-        if (!peek(tokens, *pos, TOKEN_IDENTIFIER)) return -1;
-        strncpy(sel->where_column, tokens[*pos].value, 31);
-        sel->where_column[31] = '\0';
-        (*pos)++;
-        
-        if (!expect(tokens, pos, TOKEN_EQUAL)) return -1;
-        
-        if (!peek(tokens, *pos, TOKEN_NUMBER) && !peek(tokens, *pos, TOKEN_STRING)) {
-            return -1;
+
+        if (!parser_check(p, TOKEN_IDENTIFIER)) {
+            return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
         }
-        strncpy(sel->where_value, tokens[*pos].value, 31);
-        sel->where_value[31] = '\0';
-        (*pos)++;
+        strncpy(sel->where_column, parser_peek(p)->value, 31);
+        sel->where_column[31] = '\0';
+        parser_advance(p);
+
+        if (!parser_expect(p, TOKEN_EQUAL)) {
+            return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        }
+
+        if (parser_check(p, TOKEN_NUMBER)) {
+            sel->where_value_type = LITERAL_NUMBER;
+            strncpy(sel->where_value, parser_peek(p)->value, sizeof(sel->where_value) - 1);
+            sel->where_value[sizeof(sel->where_value) - 1] = '\0';
+            parser_advance(p);
+        } else if (parser_check(p, TOKEN_STRING)) {
+            sel->where_value_type = LITERAL_STRING;
+            strncpy(sel->where_value, parser_peek(p)->value, sizeof(sel->where_value) - 1);
+            sel->where_value[sizeof(sel->where_value) - 1] = '\0';
+            parser_advance(p);
+        } else {
+            return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        }
     }
-    
-    if (!expect(tokens, pos, TOKEN_SEMICOLON)) return -1;
-    
-    return 0;
+
+    if (!parser_expect(p, TOKEN_SEMICOLON)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+
+    if (!parser_at_end(p)) {
+        return PARSE_TRAILING_TOKENS;
+    }
+    return PARSE_OK;
 }
 
-static int parse_insert(Token* tokens, int* pos, int token_count, AST* ast) {
-    InsertQuery* ins = &ast->query.insert;
+static ParseStatus parse_insert(Parser *p, AST *ast) {
+    InsertQuery *ins = &ast->query.insert;
+    int32_t id;
+
     ins->table_name[0] = '\0';
     ins->id = 0;
     ins->name[0] = '\0';
-    
-    if (!expect(tokens, pos, TOKEN_INSERT)) return -1;
-    if (!expect(tokens, pos, TOKEN_INTO)) return -1;
-    
-    if (!peek(tokens, *pos, TOKEN_IDENTIFIER)) return -1;
-    strncpy(ins->table_name, tokens[*pos].value, 31);
+
+    if (!parser_expect(p, TOKEN_INSERT)) {
+        return PARSE_ERROR;
+    }
+    if (!parser_expect(p, TOKEN_INTO)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+
+    if (!parser_check(p, TOKEN_IDENTIFIER)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+    strncpy(ins->table_name, parser_peek(p)->value, 31);
     ins->table_name[31] = '\0';
-    (*pos)++;
-    
-    if (!expect(tokens, pos, TOKEN_VALUES)) return -1;
-    if (!expect(tokens, pos, TOKEN_LPAREN)) return -1;
-    
-    if (!peek(tokens, *pos, TOKEN_NUMBER)) return -1;
-    ins->id = atoi(tokens[*pos].value);
-    (*pos)++;
-    
-    if (!expect(tokens, pos, TOKEN_COMMA)) return -1;
-    
-    if (!peek(tokens, *pos, TOKEN_STRING)) return -1;
-    strncpy(ins->name, tokens[*pos].value, 31);
+    parser_advance(p);
+
+    if (!parser_expect(p, TOKEN_VALUES)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+    if (!parser_expect(p, TOKEN_LPAREN)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+
+    if (!parser_check(p, TOKEN_NUMBER)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+    if (!util_parse_int32(parser_peek(p)->value, &id)) {
+        return PARSE_ERROR;
+    }
+    ins->id = id;
+    parser_advance(p);
+
+    if (!parser_expect(p, TOKEN_COMMA)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+
+    if (!parser_check(p, TOKEN_STRING)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+    strncpy(ins->name, parser_peek(p)->value, 31);
     ins->name[31] = '\0';
-    (*pos)++;
-    
-    if (!expect(tokens, pos, TOKEN_RPAREN)) return -1;
-    if (!expect(tokens, pos, TOKEN_SEMICOLON)) return -1;
-    
-    return 0;
+    parser_advance(p);
+
+    if (!parser_expect(p, TOKEN_RPAREN)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+    if (!parser_expect(p, TOKEN_SEMICOLON)) {
+        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+    }
+
+    if (!parser_at_end(p)) {
+        return PARSE_TRAILING_TOKENS;
+    }
+    return PARSE_OK;
 }
 
-int parse(Token* tokens, int token_count, AST* ast) {
-    if (tokens == NULL || token_count == 0) {
-        return -1;
+ParseStatus parse(const Token *tokens, int token_count, AST *ast) {
+    Parser p;
+
+    if (tokens == NULL || ast == NULL || token_count <= 0) {
+        return PARSE_NULL_INPUT;
     }
-    
+
     ast->type = AST_UNKNOWN;
-    
-    if (peek(tokens, 0, TOKEN_SELECT)) {
+    parser_init(&p, tokens, (size_t)token_count);
+
+    if (parser_check(&p, TOKEN_SELECT)) {
         ast->type = AST_SELECT;
-        int pos = 0;
-        return parse_select(tokens, &pos, token_count, ast);
+        return parse_select(&p, ast);
     }
-    else if (peek(tokens, 0, TOKEN_INSERT)) {
+    if (parser_check(&p, TOKEN_INSERT)) {
         ast->type = AST_INSERT;
-        int pos = 0;
-        return parse_insert(tokens, &pos, token_count, ast);
+        return parse_insert(&p, ast);
     }
-    
-    return -1;
+    if (parser_at_end(&p)) {
+        return PARSE_UNEXPECTED_EOF;
+    }
+    return PARSE_ERROR;
 }
 
-void ast_free(AST* ast) {
+void ast_free(AST *ast) {
     (void)ast;
 }

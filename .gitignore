@@ -1,11 +1,17 @@
 # Build output
 sqlengine
+sqlengine_tests
 obj/
 
 # Data files
 *.tbl
 *.idx
+*.tmp
 
-# OS files
+# OS / editor
 .DS_Store
 *.swp
+*~
+
+# Sanitizer / debug
+*.dSYM/

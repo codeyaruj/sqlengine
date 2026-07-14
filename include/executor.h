@@ -2,7 +2,8 @@
 #define EXECUTOR_H
 
 #include "parser.h"
+#include "status.h"
 
-int execute(AST* ast);
+ExecStatus execute(AST *ast);
 
 #endif
