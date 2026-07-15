@@ -48,12 +48,24 @@ typedef struct {
 } AST;
 
 typedef struct {
-    const Token *tokens;
-    size_t count;
-    size_t pos;
+    TokenBuffer tokens;
+    size_t position;
 } Parser;
 
-void parser_init(Parser *p, const Token *tokens, size_t count);
+/*
+ * Token-buffer contract:
+ *
+ * - tokens.data may be NULL only when tokens.count is zero.
+ * - When tokens.count is nonzero, tokens.data points to at least tokens.count
+ *   initialized Token objects.
+ * - The parser reads only [tokens.data, tokens.data + tokens.count).
+ * - TOKEN_EOF is optional for memory safety. Reaching tokens.count without one
+ *   is reported as unexpected end of input.
+ *
+ * A count larger than the accessible allocation violates this contract and
+ * cannot be detected portably from a C pointer alone.
+ */
+void parser_init(Parser *p, TokenBuffer tokens);
 bool parser_at_end(const Parser *p);
 const Token *parser_peek(const Parser *p);
 const Token *parser_previous(const Parser *p);
@@ -62,7 +74,7 @@ bool parser_check(const Parser *p, TokenType type);
 bool parser_match(Parser *p, TokenType type);
 bool parser_expect(Parser *p, TokenType type);
 
-ParseStatus parse(const Token *tokens, int token_count, AST *ast);
+ParseStatus parse_tokens(TokenBuffer tokens, AST *ast);
 void ast_free(AST *ast);
 
 #endif

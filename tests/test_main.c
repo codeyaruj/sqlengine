@@ -83,9 +83,11 @@ static void reset_workdir(void) {
 
 static void test_tokenize_valid_select(void) {
     Token tokens[32];
-    int n = 0;
+    TokenBuffer result = { NULL, 0 };
     test_begin("tokenizer valid SELECT");
-    ASSERT_EQ_INT(tokenize("SELECT * FROM users;", tokens, 32, &n), TOKENIZE_OK);
+    ASSERT_EQ_INT(tokenize("SELECT * FROM users;", tokens, 32, &result), TOKENIZE_OK);
+    ASSERT_TRUE(result.data == tokens);
+    ASSERT_EQ_INT(result.count, 6);
     ASSERT_EQ_INT(tokens[0].type, TOKEN_SELECT);
     ASSERT_EQ_INT(tokens[1].type, TOKEN_STAR);
     ASSERT_EQ_INT(tokens[2].type, TOKEN_FROM);
@@ -98,9 +100,12 @@ static void test_tokenize_valid_select(void) {
 
 static void test_tokenize_valid_insert(void) {
     Token tokens[32];
-    int n = 0;
+    TokenBuffer result = { NULL, 0 };
     test_begin("tokenizer valid INSERT");
-    ASSERT_EQ_INT(tokenize("INSERT INTO users VALUES (1, \"Aruj\");", tokens, 32, &n), TOKENIZE_OK);
+    ASSERT_EQ_INT(tokenize("INSERT INTO users VALUES (1, \"Aruj\");", tokens, 32,
+                           &result), TOKENIZE_OK);
+    ASSERT_TRUE(result.data == tokens);
+    ASSERT_EQ_INT(result.count, 11);
     ASSERT_EQ_INT(tokens[0].type, TOKEN_INSERT);
     ASSERT_EQ_INT(tokens[1].type, TOKEN_INTO);
     ASSERT_EQ_INT(tokens[5].type, TOKEN_NUMBER);
@@ -112,12 +117,13 @@ static void test_tokenize_valid_insert(void) {
 
 static void test_tokenize_mixed_case(void) {
     Token tokens[32];
-    int n = 0;
+    TokenBuffer result = { NULL, 0 };
     test_begin("tokenizer mixed-case keywords");
-    ASSERT_EQ_INT(tokenize("select * From users;", tokens, 32, &n), TOKENIZE_OK);
+    ASSERT_EQ_INT(tokenize("select * From users;", tokens, 32, &result), TOKENIZE_OK);
     ASSERT_EQ_INT(tokens[0].type, TOKEN_SELECT);
     ASSERT_EQ_INT(tokens[2].type, TOKEN_FROM);
-    ASSERT_EQ_INT(tokenize("Insert Into users Values (2, \"B\");", tokens, 32, &n), TOKENIZE_OK);
+    ASSERT_EQ_INT(tokenize("Insert Into users Values (2, \"B\");", tokens, 32,
+                           &result), TOKENIZE_OK);
     ASSERT_EQ_INT(tokens[0].type, TOKEN_INSERT);
     ASSERT_EQ_INT(tokens[1].type, TOKEN_INTO);
     ASSERT_EQ_INT(tokens[3].type, TOKEN_VALUES);
@@ -126,9 +132,12 @@ static void test_tokenize_mixed_case(void) {
 
 static void test_tokenize_invalid_char(void) {
     Token tokens[32];
-    int n = 0;
+    TokenBuffer result = TOKEN_BUFFER_FROM_ARRAY(tokens);
     test_begin("tokenizer invalid character");
-    ASSERT_EQ_INT(tokenize("SELECT @ FROM users;", tokens, 32, &n), TOKENIZE_INVALID_CHARACTER);
+    ASSERT_EQ_INT(tokenize("SELECT @ FROM users;", tokens, 32, &result),
+                  TOKENIZE_INVALID_CHARACTER);
+    ASSERT_TRUE(result.data == NULL);
+    ASSERT_EQ_INT(result.count, 0);
     test_end();
 }
 
@@ -137,7 +146,7 @@ static void test_tokenize_long_token(void) {
     char too_long[TOKEN_VALUE_MAX + 16];
     char sql[256];
     Token tokens[16];
-    int n = 0;
+    TokenBuffer result = { NULL, 0 };
     size_t i;
 
     test_begin("tokenizer max length and overflow");
@@ -146,14 +155,16 @@ static void test_tokenize_long_token(void) {
     }
     long_ident[TOKEN_VALUE_MAX] = '\0';
     snprintf(sql, sizeof(sql), "SELECT %s FROM t;", long_ident);
-    ASSERT_EQ_INT(tokenize(sql, tokens, 16, &n), TOKENIZE_OK);
+    ASSERT_EQ_INT(tokenize(sql, tokens, 16, &result), TOKENIZE_OK);
 
     for (i = 0; i < TOKEN_VALUE_MAX + 1; i++) {
         too_long[i] = 'b';
     }
     too_long[TOKEN_VALUE_MAX + 1] = '\0';
     snprintf(sql, sizeof(sql), "SELECT %s FROM t;", too_long);
-    ASSERT_EQ_INT(tokenize(sql, tokens, 16, &n), TOKENIZE_TOKEN_TOO_LONG);
+    ASSERT_EQ_INT(tokenize(sql, tokens, 16, &result), TOKENIZE_TOKEN_TOO_LONG);
+    ASSERT_TRUE(result.data == NULL);
+    ASSERT_EQ_INT(result.count, 0);
     test_end();
 }
 
@@ -162,7 +173,7 @@ static void test_tokenize_long_number_string(void) {
     char strbody[TOKEN_VALUE_MAX + 4];
     char sql[256];
     Token tokens[16];
-    int n = 0;
+    TokenBuffer result = { NULL, 0 };
     size_t i;
 
     test_begin("tokenizer long number and string");
@@ -171,32 +182,41 @@ static void test_tokenize_long_number_string(void) {
     }
     num[TOKEN_VALUE_MAX + 1] = '\0';
     snprintf(sql, sizeof(sql), "SELECT * FROM t WHERE id = %s;", num);
-    ASSERT_EQ_INT(tokenize(sql, tokens, 16, &n), TOKENIZE_TOKEN_TOO_LONG);
+    ASSERT_EQ_INT(tokenize(sql, tokens, 16, &result), TOKENIZE_TOKEN_TOO_LONG);
+    ASSERT_TRUE(result.data == NULL);
+    ASSERT_EQ_INT(result.count, 0);
 
     for (i = 0; i < TOKEN_VALUE_MAX + 1; i++) {
         strbody[i] = 'x';
     }
     strbody[TOKEN_VALUE_MAX + 1] = '\0';
     snprintf(sql, sizeof(sql), "INSERT INTO t VALUES (1, \"%s\");", strbody);
-    ASSERT_EQ_INT(tokenize(sql, tokens, 16, &n), TOKENIZE_TOKEN_TOO_LONG);
+    ASSERT_EQ_INT(tokenize(sql, tokens, 16, &result), TOKENIZE_TOKEN_TOO_LONG);
+    ASSERT_TRUE(result.data == NULL);
+    ASSERT_EQ_INT(result.count, 0);
     test_end();
 }
 
 static void test_tokenize_unterminated(void) {
     Token tokens[16];
-    int n = 0;
+    TokenBuffer result = TOKEN_BUFFER_FROM_ARRAY(tokens);
     test_begin("tokenizer unterminated string");
-    ASSERT_EQ_INT(tokenize("INSERT INTO t VALUES (1, \"abc);", tokens, 16, &n),
+    ASSERT_EQ_INT(tokenize("INSERT INTO t VALUES (1, \"abc);", tokens, 16, &result),
                   TOKENIZE_UNTERMINATED_STRING);
+    ASSERT_TRUE(result.data == NULL);
+    ASSERT_EQ_INT(result.count, 0);
     test_end();
 }
 
 static void test_tokenize_capacity(void) {
     Token tokens[4];
-    int n = 0;
+    TokenBuffer result = TOKEN_BUFFER_FROM_ARRAY(tokens);
     test_begin("tokenizer token capacity exhaustion");
     /* SELECT * FROM users ; EOF needs 6 slots */
-    ASSERT_EQ_INT(tokenize("SELECT * FROM users;", tokens, 4, &n), TOKENIZE_TOO_MANY_TOKENS);
+    ASSERT_EQ_INT(tokenize("SELECT * FROM users;", tokens, 4, &result),
+                  TOKENIZE_TOO_MANY_TOKENS);
+    ASSERT_TRUE(result.data == NULL);
+    ASSERT_EQ_INT(result.count, 0);
     test_end();
 }
 
@@ -204,12 +224,12 @@ static void test_tokenize_capacity(void) {
 
 static ParseStatus parse_sql(const char *sql, AST *ast) {
     Token tokens[64];
-    int n = 0;
-    TokenizeStatus ts = tokenize(sql, tokens, 64, &n);
+    TokenBuffer result = { NULL, 0 };
+    TokenizeStatus ts = tokenize(sql, tokens, 64, &result);
     if (ts != TOKENIZE_OK) {
         return PARSE_ERROR;
     }
-    return parse(tokens, n, ast);
+    return parse_tokens(result, ast);
 }
 
 static uint64_t table_row_count(const char *name) {
@@ -320,12 +340,14 @@ static void test_parser_trailing(void) {
 static void test_parser_bounds_safe(void) {
     /* Empty token stream with only EOF */
     Token tokens[2];
+    TokenBuffer result = { NULL, 0 };
     AST ast;
-    int n = 0;
     test_begin("parser safe EOF handling");
-    ASSERT_EQ_INT(tokenize("", tokens, 2, &n), TOKENIZE_OK);
-    ASSERT_TRUE(parse(tokens, n, &ast) != PARSE_OK);
-    ASSERT_TRUE(parse(NULL, 0, &ast) != PARSE_OK);
+    ASSERT_EQ_INT(tokenize("", tokens, 2, &result), TOKENIZE_OK);
+    ASSERT_EQ_INT(parse_tokens(result, &ast), PARSE_UNEXPECTED_EOF);
+    ASSERT_EQ_INT(parse_tokens((TokenBuffer){ NULL, 0 }, &ast), PARSE_UNEXPECTED_EOF);
+    ASSERT_EQ_INT(parse_tokens((TokenBuffer){ NULL, 1 }, &ast), PARSE_NULL_INPUT);
+    ASSERT_STREQ(parse_status_string(PARSE_UNEXPECTED_EOF), "unexpected end of input");
     test_end();
 }
 
@@ -1154,17 +1176,17 @@ static void test_read_only_select_and_index_fallback(void) {
 
 static void test_signed_int32_ids(void) {
     Token tokens[32];
-    int token_count = 0;
+    TokenBuffer token_buffer = { NULL, 0 };
     AST ast;
     char output[1024];
 
     test_begin("signed int32 IDs and boundaries");
     reset_workdir();
     ASSERT_EQ_INT(tokenize("INSERT INTO users VALUES (-1, \"negative\");",
-                           tokens, 32, &token_count), TOKENIZE_OK);
+                           tokens, 32, &token_buffer), TOKENIZE_OK);
     ASSERT_STREQ(tokens[5].value, "-1");
     ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_OK);
-    ASSERT_EQ_INT(parse(tokens, token_count, &ast), PARSE_OK);
+    ASSERT_EQ_INT(parse_tokens(token_buffer, &ast), PARSE_OK);
     ASSERT_EQ_INT(execute(&ast), EXEC_OK);
     ASSERT_EQ_INT(parse_sql("INSERT INTO users VALUES (-2147483648, \"min\");", &ast), PARSE_OK);
     ASSERT_EQ_INT(execute(&ast), EXEC_OK);
@@ -1177,9 +1199,12 @@ static void test_signed_int32_ids(void) {
                   PARSE_INTEGER_OUT_OF_RANGE);
     ASSERT_EQ_INT(parse_sql("INSERT INTO users VALUES (2147483648, \"bad\");", &ast),
                   PARSE_INTEGER_OUT_OF_RANGE);
-    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = -;", tokens, 32, &token_count) != TOKENIZE_OK);
-    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = --1;", tokens, 32, &token_count) != TOKENIZE_OK);
-    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = -abc;", tokens, 32, &token_count) != TOKENIZE_OK);
+    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = -;", tokens, 32,
+                         &token_buffer) != TOKENIZE_OK);
+    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = --1;", tokens, 32,
+                         &token_buffer) != TOKENIZE_OK);
+    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = -abc;", tokens, 32,
+                         &token_buffer) != TOKENIZE_OK);
     ASSERT_TRUE(parse_sql("SELECT * FROM users WHERE id = 1-2;", &ast) != PARSE_OK);
     test_end();
 }
@@ -1197,20 +1222,57 @@ static void test_parser_truncated_arrays(void) {
         {TOKEN_STAR, "*"},
         {TOKEN_FROM, "FROM"}
     };
+    Token select_only[] = {
+        {TOKEN_SELECT, "SELECT"}
+    };
+    Token insert_no_eof[] = {
+        {TOKEN_INSERT, "INSERT"},
+        {TOKEN_INTO, "INTO"},
+        {TOKEN_IDENTIFIER, "users"},
+        {TOKEN_VALUES, "VALUES"},
+        {TOKEN_LPAREN, "("},
+        {TOKEN_NUMBER, "1"},
+        {TOKEN_COMMA, ","}
+    };
+    Token uninitialized;
     Parser parser;
     AST ast;
     size_t i;
 
     test_begin("parser truncated arrays and missing EOF");
+    ASSERT_TRUE(parser_at_end(NULL));
+    ASSERT_EQ_INT(parser_peek(NULL)->type, TOKEN_EOF);
+    ASSERT_EQ_INT(parser_previous(NULL)->type, TOKEN_EOF);
+    ASSERT_EQ_INT(parser_advance(NULL)->type, TOKEN_EOF);
     for (i = 0; i < sizeof(statements) / sizeof(statements[0]); i++) {
-        ASSERT_TRUE(parse_sql(statements[i], &ast) != PARSE_OK);
+        Token storage[32];
+        TokenBuffer buffer = { NULL, 0 };
+        ASSERT_EQ_INT(tokenize(statements[i], storage, 32, &buffer), TOKENIZE_OK);
+        ASSERT_TRUE(buffer.count > 0);
+        ASSERT_EQ_INT(buffer.data[buffer.count - 1].type, TOKEN_EOF);
+        buffer.count--;
+        ASSERT_EQ_INT(parse_tokens(buffer, &ast), PARSE_UNEXPECTED_EOF);
     }
-    ASSERT_EQ_INT(parse(no_eof, 0, &ast), PARSE_NULL_INPUT);
-    ASSERT_TRUE(parse(no_eof, 1, &ast) != PARSE_OK);
-    ASSERT_TRUE(parse(no_eof, 3, &ast) != PARSE_OK);
-    ASSERT_TRUE(parse(no_eof, 2, &ast) != PARSE_OK);
-    parser_init(&parser, no_eof, 2);
-    parser.pos = 3;
+    ASSERT_EQ_INT(parse_tokens((TokenBuffer){ NULL, 0 }, &ast), PARSE_UNEXPECTED_EOF);
+    ASSERT_EQ_INT(parse_tokens((TokenBuffer){ &uninitialized, 0 }, &ast),
+                  PARSE_UNEXPECTED_EOF);
+    ASSERT_EQ_INT(parse_tokens(TOKEN_BUFFER_FROM_ARRAY(select_only), &ast),
+                  PARSE_UNEXPECTED_EOF);
+    ASSERT_EQ_INT(parse_tokens(TOKEN_BUFFER_FROM_ARRAY(no_eof), &ast),
+                  PARSE_UNEXPECTED_EOF);
+    ASSERT_EQ_INT(parse_tokens(TOKEN_BUFFER_FROM_ARRAY(insert_no_eof), &ast),
+                  PARSE_UNEXPECTED_EOF);
+
+    parser_init(&parser, TOKEN_BUFFER_FROM_ARRAY(no_eof));
+    ASSERT_EQ_INT(parser_previous(&parser)->type, TOKEN_EOF);
+    parser.position = parser.tokens.count;
+    ASSERT_TRUE(parser_at_end(&parser));
+    ASSERT_EQ_INT(parser_peek(&parser)->type, TOKEN_EOF);
+    ASSERT_EQ_INT(parser_previous(&parser)->type, TOKEN_FROM);
+    parser_advance(&parser);
+    ASSERT_EQ_INT(parser.position, parser.tokens.count);
+    parser.position = parser.tokens.count + 1;
+    ASSERT_TRUE(parser_at_end(&parser));
     ASSERT_EQ_INT(parser_peek(&parser)->type, TOKEN_EOF);
     ASSERT_EQ_INT(parser_previous(&parser)->type, TOKEN_EOF);
     test_end();

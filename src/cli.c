@@ -101,24 +101,24 @@ static void handle_meta_command(const char *input) {
 }
 
 static int handle_sql_input(const char *input) {
-    Token tokens[MAX_TOKENS];
-    int token_count = 0;
+    Token token_storage[MAX_TOKENS];
+    TokenBuffer tokens = { NULL, 0 };
     TokenizeStatus tstat;
     ParseStatus pstat;
     AST ast;
     ExecStatus estat;
 
-    tstat = tokenize(input, tokens, MAX_TOKENS, &token_count);
+    tstat = tokenize(input, token_storage, MAX_TOKENS, &tokens);
     if (tstat != TOKENIZE_OK) {
         printf("Error: Tokenizer: %s.\n", tokenize_status_string(tstat));
         return -1;
     }
 
-    if (token_count == 0 || tokens[0].type == TOKEN_EOF) {
+    if (tokens.count == 0 || tokens.data[0].type == TOKEN_EOF) {
         return 0;
     }
 
-    pstat = parse(tokens, token_count, &ast);
+    pstat = parse_tokens(tokens, &ast);
     if (pstat != PARSE_OK) {
         printf("Error: Parser: %s.\n", parse_status_string(pstat));
         return -1;

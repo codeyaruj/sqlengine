@@ -3,46 +3,48 @@
 
 #include <string.h>
 
-void parser_init(Parser *p, const Token *tokens, size_t count) {
+void parser_init(Parser *p, TokenBuffer tokens) {
+    if (p == NULL) {
+        return;
+    }
     p->tokens = tokens;
-    p->count = count;
-    p->pos = 0;
+    p->position = 0;
 }
 
 bool parser_at_end(const Parser *p) {
-    if (p == NULL || p->tokens == NULL || p->count == 0) {
+    if (p == NULL || p->tokens.data == NULL || p->tokens.count == 0) {
         return true;
     }
-    if (p->pos >= p->count) {
+    if (p->position >= p->tokens.count) {
         return true;
     }
-    return p->tokens[p->pos].type == TOKEN_EOF;
+    return p->tokens.data[p->position].type == TOKEN_EOF;
 }
 
 const Token *parser_peek(const Parser *p) {
     static const Token eof_token = { TOKEN_EOF, "" };
-    if (p == NULL || p->tokens == NULL || p->count == 0) {
+    if (p == NULL || p->tokens.data == NULL || p->tokens.count == 0) {
         return &eof_token;
     }
-    if (p->pos >= p->count) {
+    if (p->position >= p->tokens.count) {
         return &eof_token;
     }
-    return &p->tokens[p->pos];
+    return &p->tokens.data[p->position];
 }
 
 const Token *parser_previous(const Parser *p) {
     static const Token eof_token = { TOKEN_EOF, "" };
-    if (p == NULL || p->tokens == NULL || p->count == 0 ||
-        p->pos == 0 || p->pos > p->count) {
+    if (p == NULL || p->tokens.data == NULL || p->tokens.count == 0 ||
+        p->position == 0 || p->position > p->tokens.count) {
         return &eof_token;
     }
-    return &p->tokens[p->pos - 1];
+    return &p->tokens.data[p->position - 1];
 }
 
 const Token *parser_advance(Parser *p) {
     const Token *cur = parser_peek(p);
-    if (!parser_at_end(p) && p->pos < p->count) {
-        p->pos++;
+    if (!parser_at_end(p) && p->position < p->tokens.count) {
+        p->position++;
     }
     return cur;
 }
@@ -233,15 +235,15 @@ static ParseStatus parse_insert(Parser *p, AST *ast) {
     return PARSE_OK;
 }
 
-ParseStatus parse(const Token *tokens, int token_count, AST *ast) {
+ParseStatus parse_tokens(TokenBuffer tokens, AST *ast) {
     Parser p;
 
-    if (tokens == NULL || ast == NULL || token_count <= 0) {
+    if (ast == NULL || (tokens.data == NULL && tokens.count != 0)) {
         return PARSE_NULL_INPUT;
     }
 
     ast->type = AST_UNKNOWN;
-    parser_init(&p, tokens, (size_t)token_count);
+    parser_init(&p, tokens);
 
     if (parser_check(&p, TOKEN_SELECT)) {
         ast->type = AST_SELECT;

@@ -46,14 +46,16 @@ static void consume_rest_string(const char **pp) {
     *pp = p;
 }
 
-TokenizeStatus tokenize(const char *input, Token *tokens, int max_tokens, int *out_count) {
-    int count = 0;
+TokenizeStatus tokenize(const char *input, Token *storage, size_t storage_capacity,
+                        TokenBuffer *result) {
+    size_t count = 0;
     const char *p;
 
-    if (out_count != NULL) {
-        *out_count = 0;
+    if (result != NULL) {
+        result->data = NULL;
+        result->count = 0;
     }
-    if (input == NULL || tokens == NULL || max_tokens < 1) {
+    if (input == NULL || storage == NULL || storage_capacity < 1 || result == NULL) {
         return TOKENIZE_NULL_INPUT;
     }
 
@@ -70,7 +72,7 @@ TokenizeStatus tokenize(const char *input, Token *tokens, int max_tokens, int *o
         }
 
         /* Need room for this token plus a final EOF. */
-        if (count >= max_tokens - 1) {
+        if (count >= storage_capacity - 1) {
             return TOKENIZE_TOO_MANY_TOKENS;
         }
 
@@ -153,20 +155,19 @@ TokenizeStatus tokenize(const char *input, Token *tokens, int max_tokens, int *o
             return TOKENIZE_INVALID_CHARACTER;
         }
 
-        tokens[count++] = token;
+        storage[count++] = token;
     }
 
-    if (count >= max_tokens) {
+    if (count >= storage_capacity) {
         return TOKENIZE_TOO_MANY_TOKENS;
     }
 
-    tokens[count].type = TOKEN_EOF;
-    tokens[count].value[0] = '\0';
+    storage[count].type = TOKEN_EOF;
+    storage[count].value[0] = '\0';
     count++;
 
-    if (out_count != NULL) {
-        *out_count = count;
-    }
+    result->data = storage;
+    result->count = count;
     return TOKENIZE_OK;
 }
 
