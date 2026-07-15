@@ -3,8 +3,16 @@ CFLAGS ?=
 CPPFLAGS ?=
 LDFLAGS ?=
 
+CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Iinclude
+
+# Darwin exposes mkdtemp() in its extension namespace even though it is POSIX.1-2008.
+ifeq ($(shell uname -s),Darwin)
+CPPFLAGS += -D_DARWIN_C_SOURCE
+endif
+
 # Project warning flags (appended; user CFLAGS still apply)
-WARN_FLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wstrict-prototypes -Wmissing-prototypes
+WARN_FLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wstrict-prototypes -Wmissing-prototypes -Werror \
+	-Werror=implicit-function-declaration
 STD_FLAGS = -std=c11
 DEPFLAGS = -MMD -MP
 
@@ -13,8 +21,6 @@ OBJ_DIR = obj
 TEST_DIR = tests
 BIN = sqlengine
 TEST_BIN = sqlengine_tests
-
-INCLUDES = -Iinclude
 
 LIB_SRCS = \
 	$(SRC_DIR)/status.c \
@@ -37,7 +43,7 @@ TEST_OBJ = $(OBJ_DIR)/test_main.o
 
 DEPS = $(LIB_OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
-ALL_CFLAGS = $(STD_FLAGS) $(WARN_FLAGS) $(INCLUDES) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS)
+ALL_CFLAGS = $(STD_FLAGS) $(WARN_FLAGS) $(CFLAGS) $(DEPFLAGS)
 
 .PHONY: all clean test debug asan ubsan sanitize
 
@@ -47,10 +53,10 @@ $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
-	$(CC) $(ALL_CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/test_main.o: $(TEST_SRC) | $(OBJ_DIR)
-	$(CC) $(ALL_CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) -c $< -o $@
 
 $(BIN): $(LIB_OBJS) $(MAIN_OBJ)
 	$(CC) $(LIB_OBJS) $(MAIN_OBJ) $(LDFLAGS) -o $@

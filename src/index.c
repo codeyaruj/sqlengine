@@ -1,5 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "index.h"
 #include "util.h"
 
@@ -340,10 +338,14 @@ IndexStatus index_load(const char *table_name, Index **out) {
         !util_mul_u64((uint64_t)entry_count, (uint64_t)INDEX_ENTRY_ONDISK,
                       &entries_size) ||
         !util_add_u64((uint64_t)INDEX_HEADER_SIZE, entries_size, &expected_size) ||
-        expected_size != (uint64_t)file_size ||
-        (uint64_t)entry_count > (uint64_t)SIZE_MAX) {
+        expected_size != (uint64_t)file_size) {
         goto done;
     }
+#if SIZE_MAX < UINT32_MAX
+    if (entry_count > (uint32_t)SIZE_MAX) {
+        goto done;
+    }
+#endif
     if (fseek(f, (long)INDEX_HEADER_SIZE, SEEK_SET) != 0) {
         result = INDEX_IO_ERROR;
         goto done;
