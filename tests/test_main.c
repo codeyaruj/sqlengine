@@ -59,15 +59,76 @@ static void test_end(void) {
     g_passed++;
 }
 
+static int remove_tree(const char *path) {
+    DIR *directory;
+    struct dirent *entry;
+    int first_error = 0;
+
+    directory = opendir(path);
+    if (directory == NULL) {
+        return errno == ENOENT ? 0 : -1;
+    }
+
+    for (;;) {
+        char child[PATH_MAX];
+        struct stat st;
+        int written;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0 && first_error == 0) {
+                first_error = errno;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        written = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        if (written < 0 || (size_t)written >= sizeof(child)) {
+            if (first_error == 0) {
+                first_error = ENAMETOOLONG;
+            }
+            continue;
+        }
+        if (lstat(child, &st) != 0) {
+            if (errno != ENOENT && first_error == 0) {
+                first_error = errno;
+            }
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (remove_tree(child) != 0 && first_error == 0) {
+                first_error = errno;
+            }
+        } else if (unlink(child) != 0 && errno != ENOENT && first_error == 0) {
+            first_error = errno;
+        }
+    }
+
+    if (closedir(directory) != 0 && first_error == 0) {
+        first_error = errno;
+    }
+    if (rmdir(path) != 0 && errno != ENOENT && first_error == 0) {
+        first_error = errno;
+    }
+    if (first_error != 0) {
+        errno = first_error;
+        return -1;
+    }
+    return 0;
+}
+
 static void reset_workdir(void) {
-    char cmd[640];
     if (chdir(g_home) != 0) {
         perror("chdir home");
         exit(1);
     }
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);
-    if (system(cmd) != 0) {
-        /* ignore */
+    if (remove_tree(g_tmpdir) != 0) {
+        perror("remove temporary test directory");
+        exit(1);
     }
     if (mkdir(g_tmpdir, 0700) != 0 && errno != EEXIST) {
         perror("mkdir tmp");
@@ -1338,11 +1399,12 @@ int main(void) {
     test_signed_int32_ids();
     test_parser_truncated_arrays();
 
-    chdir(g_home);
-    {
-        char cmd[640];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);
-        system(cmd);
+    if (chdir(g_home) != 0) {
+        perror("restore working directory");
+        g_failures++;
+    } else if (remove_tree(g_tmpdir) != 0) {
+        perror("remove temporary test directory");
+        g_failures++;
     }
 
     printf("\n%d tests completed, %d failure(s)\n", g_passed + g_failures, g_failures);
