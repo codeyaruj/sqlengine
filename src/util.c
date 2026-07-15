@@ -1,10 +1,16 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "util.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 bool util_mul_size(size_t a, size_t b, size_t *out) {
     if (out == NULL) {
@@ -50,16 +56,29 @@ bool util_add_u64(uint64_t a, uint64_t b, uint64_t *out) {
     return true;
 }
 
+bool util_copy_checked(char *destination, size_t destination_size, const char *source) {
+    size_t length;
+    if (destination == NULL || destination_size == 0 || source == NULL) {
+        return false;
+    }
+    length = strlen(source);
+    if (length >= destination_size) {
+        return false;
+    }
+    memcpy(destination, source, length + 1);
+    return true;
+}
+
 bool util_parse_int32(const char *text, int32_t *out) {
     char *end = NULL;
-    long v;
+    intmax_t v;
 
     if (text == NULL || out == NULL || text[0] == '\0') {
         return false;
     }
 
     errno = 0;
-    v = strtol(text, &end, 10);
+    v = strtoimax(text, &end, 10);
     if (errno == ERANGE || end == text || *end != '\0') {
         return false;
     }
@@ -68,6 +87,141 @@ bool util_parse_int32(const char *text, int32_t *out) {
     }
 
     *out = (int32_t)v;
+    return true;
+}
+
+bool util_secure_temp_file(const char *destination, char *path, size_t path_size, int *fd) {
+    static const char suffix[] = ".tmp.XXXXXX";
+    size_t destination_length;
+    size_t needed;
+    int local_fd;
+
+    if (destination == NULL || path == NULL || path_size == 0 || fd == NULL) {
+        errno = EINVAL;
+        return false;
+    }
+    destination_length = strlen(destination);
+    if (!util_add_size(destination_length, sizeof(suffix), &needed) || needed > path_size) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    memcpy(path, destination, destination_length);
+    memcpy(path + destination_length, suffix, sizeof(suffix));
+
+    local_fd = mkstemp(path);
+    if (local_fd < 0) {
+        return false;
+    }
+    if (fchmod(local_fd, S_IRUSR | S_IWUSR) != 0) {
+        int saved_errno = errno;
+        close(local_fd);
+        unlink(path);
+        errno = saved_errno;
+        return false;
+    }
+    (void)fcntl(local_fd, F_SETFD, FD_CLOEXEC);
+    *fd = local_fd;
+    return true;
+}
+
+bool util_flush_and_sync(FILE *f) {
+    int fd;
+    if (f == NULL) {
+        errno = EINVAL;
+        return false;
+    }
+    if (fflush(f) != 0) {
+        return false;
+    }
+    fd = fileno(f);
+    if (fd < 0 || fsync(fd) != 0) {
+        return false;
+    }
+    return true;
+}
+
+bool util_sync_parent_directory(const char *path) {
+    char directory[512];
+    const char *slash;
+    size_t length;
+    int flags = O_RDONLY;
+    int fd;
+    int result;
+    int saved_errno;
+
+    if (path == NULL) {
+        errno = EINVAL;
+        return false;
+    }
+    slash = strrchr(path, '/');
+    if (slash == NULL) {
+        directory[0] = '.';
+        directory[1] = '\0';
+    } else {
+        length = (slash == path) ? 1u : (size_t)(slash - path);
+        if (length >= sizeof(directory)) {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+        memcpy(directory, path, length);
+        directory[length] = '\0';
+    }
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+    fd = open(directory, flags);
+    if (fd < 0) {
+        return false;
+    }
+    result = fsync(fd);
+    saved_errno = errno;
+    if (close(fd) != 0 && result == 0) {
+        return false;
+    }
+    if (result != 0) {
+        if (saved_errno == EINVAL
+#ifdef ENOTSUP
+            || saved_errno == ENOTSUP
+#endif
+        ) {
+            return true;
+        }
+        errno = saved_errno;
+        return false;
+    }
+    return true;
+}
+
+bool util_print_escaped_field(FILE *out, const unsigned char *bytes, size_t size) {
+    size_t end = size;
+    size_t i;
+    static const char hex[] = "0123456789ABCDEF";
+
+    if (out == NULL || bytes == NULL) {
+        return false;
+    }
+    while (end > 0 && bytes[end - 1] == 0) {
+        end--;
+    }
+    for (i = 0; i < end; i++) {
+        unsigned char c = bytes[i];
+        if (c == '\n') {
+            if (fputs("\\n", out) == EOF) return false;
+        } else if (c == '\r') {
+            if (fputs("\\r", out) == EOF) return false;
+        } else if (c == '\t') {
+            if (fputs("\\t", out) == EOF) return false;
+        } else if (c == '\\') {
+            if (fputs("\\\\", out) == EOF) return false;
+        } else if (c == '"') {
+            if (fputs("\\\"", out) == EOF) return false;
+        } else if (c < 0x20u || c == 0x7Fu || !isprint(c)) {
+            char escaped[5] = {'\\', 'x', hex[c >> 4], hex[c & 0x0Fu], '\0'};
+            if (fputs(escaped, out) == EOF) return false;
+        } else if (fputc((int)c, out) == EOF) {
+            return false;
+        }
+    }
     return true;
 }
 

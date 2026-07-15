@@ -80,6 +80,6 @@ sanitize: clean $(TEST_BIN) $(BIN)
 	./$(TEST_BIN)
 
 clean:
-	rm -rf $(OBJ_DIR) $(BIN) $(TEST_BIN) *.tbl *.idx *.tmp
+	rm -rf $(OBJ_DIR) $(BIN) $(TEST_BIN) *.tbl *.tbl.journal *.idx *.tmp *.tmp.*
 
 -include $(DEPS)

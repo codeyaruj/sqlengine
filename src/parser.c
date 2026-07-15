@@ -32,7 +32,8 @@ const Token *parser_peek(const Parser *p) {
 
 const Token *parser_previous(const Parser *p) {
     static const Token eof_token = { TOKEN_EOF, "" };
-    if (p == NULL || p->tokens == NULL || p->count == 0 || p->pos == 0) {
+    if (p == NULL || p->tokens == NULL || p->count == 0 ||
+        p->pos == 0 || p->pos > p->count) {
         return &eof_token;
     }
     return &p->tokens[p->pos - 1];
@@ -85,8 +86,10 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
         sel->select_all = 1;
     } else if (parser_check(p, TOKEN_IDENTIFIER)) {
         sel->select_all = 0;
-        strncpy(sel->columns[0], parser_peek(p)->value, 31);
-        sel->columns[0][31] = '\0';
+        if (!util_copy_checked(sel->columns[0], sizeof(sel->columns[0]),
+                               parser_peek(p)->value)) {
+            return PARSE_IDENTIFIER_TOO_LONG;
+        }
         sel->column_count = 1;
         parser_advance(p);
 
@@ -97,8 +100,11 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
             if (sel->column_count >= MAX_COLUMNS) {
                 return PARSE_ERROR;
             }
-            strncpy(sel->columns[sel->column_count], parser_peek(p)->value, 31);
-            sel->columns[sel->column_count][31] = '\0';
+            if (!util_copy_checked(sel->columns[sel->column_count],
+                                   sizeof(sel->columns[sel->column_count]),
+                                   parser_peek(p)->value)) {
+                return PARSE_IDENTIFIER_TOO_LONG;
+            }
             sel->column_count++;
             parser_advance(p);
         }
@@ -113,8 +119,9 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
     if (!parser_check(p, TOKEN_IDENTIFIER)) {
         return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
     }
-    strncpy(sel->table_name, parser_peek(p)->value, 31);
-    sel->table_name[31] = '\0';
+    if (!util_copy_checked(sel->table_name, sizeof(sel->table_name), parser_peek(p)->value)) {
+        return PARSE_TABLE_NAME_TOO_LONG;
+    }
     parser_advance(p);
 
     if (parser_match(p, TOKEN_WHERE)) {
@@ -123,8 +130,10 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
         if (!parser_check(p, TOKEN_IDENTIFIER)) {
             return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
         }
-        strncpy(sel->where_column, parser_peek(p)->value, 31);
-        sel->where_column[31] = '\0';
+        if (!util_copy_checked(sel->where_column, sizeof(sel->where_column),
+                               parser_peek(p)->value)) {
+            return PARSE_IDENTIFIER_TOO_LONG;
+        }
         parser_advance(p);
 
         if (!parser_expect(p, TOKEN_EQUAL)) {
@@ -133,13 +142,17 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
 
         if (parser_check(p, TOKEN_NUMBER)) {
             sel->where_value_type = LITERAL_NUMBER;
-            strncpy(sel->where_value, parser_peek(p)->value, sizeof(sel->where_value) - 1);
-            sel->where_value[sizeof(sel->where_value) - 1] = '\0';
+            if (!util_copy_checked(sel->where_value, sizeof(sel->where_value),
+                                   parser_peek(p)->value)) {
+                return PARSE_INTEGER_OUT_OF_RANGE;
+            }
             parser_advance(p);
         } else if (parser_check(p, TOKEN_STRING)) {
             sel->where_value_type = LITERAL_STRING;
-            strncpy(sel->where_value, parser_peek(p)->value, sizeof(sel->where_value) - 1);
-            sel->where_value[sizeof(sel->where_value) - 1] = '\0';
+            if (!util_copy_checked(sel->where_value, sizeof(sel->where_value),
+                                   parser_peek(p)->value)) {
+                return PARSE_STRING_TOO_LONG;
+            }
             parser_advance(p);
         } else {
             return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
@@ -174,8 +187,9 @@ static ParseStatus parse_insert(Parser *p, AST *ast) {
     if (!parser_check(p, TOKEN_IDENTIFIER)) {
         return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
     }
-    strncpy(ins->table_name, parser_peek(p)->value, 31);
-    ins->table_name[31] = '\0';
+    if (!util_copy_checked(ins->table_name, sizeof(ins->table_name), parser_peek(p)->value)) {
+        return PARSE_TABLE_NAME_TOO_LONG;
+    }
     parser_advance(p);
 
     if (!parser_expect(p, TOKEN_VALUES)) {
@@ -189,7 +203,7 @@ static ParseStatus parse_insert(Parser *p, AST *ast) {
         return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
     }
     if (!util_parse_int32(parser_peek(p)->value, &id)) {
-        return PARSE_ERROR;
+        return PARSE_INTEGER_OUT_OF_RANGE;
     }
     ins->id = id;
     parser_advance(p);
@@ -201,8 +215,9 @@ static ParseStatus parse_insert(Parser *p, AST *ast) {
     if (!parser_check(p, TOKEN_STRING)) {
         return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
     }
-    strncpy(ins->name, parser_peek(p)->value, 31);
-    ins->name[31] = '\0';
+    if (!util_copy_checked(ins->name, sizeof(ins->name), parser_peek(p)->value)) {
+        return PARSE_STRING_TOO_LONG;
+    }
     parser_advance(p);
 
     if (!parser_expect(p, TOKEN_RPAREN)) {

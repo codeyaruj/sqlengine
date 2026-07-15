@@ -28,7 +28,10 @@ static void print_header(const SelectQuery *sel) {
 static void print_row(const Row *row, const SelectQuery *sel) {
     int i;
     if (sel->select_all) {
-        printf("%-10d %s\n", (int)row->id, row->name);
+        printf("%-10d ", (int)row->id);
+        (void)util_print_escaped_field(stdout, (const unsigned char *)row->name,
+                                       STORAGE_NAME_SIZE);
+        printf("\n");
         return;
     }
     for (i = 0; i < sel->column_count; i++) {
@@ -40,7 +43,8 @@ static void print_row(const Row *row, const SelectQuery *sel) {
         if (col == COLUMN_ID) {
             printf("%d", (int)row->id);
         } else if (col == COLUMN_NAME) {
-            printf("%s", row->name);
+            (void)util_print_escaped_field(stdout, (const unsigned char *)row->name,
+                                           STORAGE_NAME_SIZE);
         }
     }
     printf("\n");
@@ -74,7 +78,7 @@ static ExecStatus execute_select(AST *ast) {
     int printed = 0;
     int used_index = 0;
 
-    tst = storage_open_table(sel->table_name, &table);
+    tst = storage_open_table_readonly(sel->table_name, &table);
     if (tst == TABLE_NOT_FOUND) {
         printf("Error: Table '%s' does not exist.\n", sel->table_name);
         return EXEC_TABLE_NOT_FOUND;
@@ -103,6 +107,12 @@ static ExecStatus execute_select(AST *ast) {
 
         if (util_parse_int32(sel->where_value, &search_id)) {
             ist = index_load_or_rebuild(sel->table_name, &index);
+            if (ist == INDEX_DUPLICATE_PRIMARY_KEY) {
+                printf("Error: Table '%s' contains duplicate primary keys.\n",
+                       sel->table_name);
+                storage_close_table(table);
+                return EXEC_TABLE_CORRUPT;
+            }
             if (ist == INDEX_OK && index != NULL) {
                 ist = index_lookup(index, search_id, &offset);
                 if (ist == INDEX_OK) {
@@ -183,6 +193,10 @@ static ExecStatus execute_insert(AST *ast) {
                tst == TABLE_INCOMPATIBLE ? "incompatible format" : "corrupt");
         return EXEC_TABLE_CORRUPT;
     }
+    if (tst == TABLE_READ_ONLY) {
+        printf("Error: Table '%s' is read-only.\n", ins->table_name);
+        return EXEC_READ_ONLY;
+    }
     if (tst != TABLE_OK) {
         printf("Error: Could not open table '%s'.\n", ins->table_name);
         return EXEC_IO_ERROR;
@@ -190,6 +204,12 @@ static ExecStatus execute_insert(AST *ast) {
 
     /* Uniqueness: prefer valid index, else page-aware scan. */
     ist = index_load_or_rebuild(ins->table_name, &index);
+    if (ist == INDEX_DUPLICATE_PRIMARY_KEY) {
+        printf("Error: Table '%s' contains duplicate primary keys.\n",
+               ins->table_name);
+        storage_close_table(table);
+        return EXEC_TABLE_CORRUPT;
+    }
     if (ist == INDEX_OK && index != NULL) {
         if (index_lookup(index, ins->id, &existing_off) == INDEX_OK) {
             Row existing;
@@ -220,10 +240,19 @@ static ExecStatus execute_insert(AST *ast) {
 
     memset(&row, 0, sizeof(row));
     row.id = ins->id;
-    strncpy(row.name, ins->name, STORAGE_NAME_SIZE - 1);
-    row.name[STORAGE_NAME_SIZE - 1] = '\0';
+    if (!util_copy_checked(row.name, sizeof(row.name), ins->name)) {
+        index_free(index);
+        storage_close_table(table);
+        return EXEC_SEMANTIC_ERROR;
+    }
 
     tst = storage_insert_row(table, &row, &offset);
+    if (tst == TABLE_READ_ONLY) {
+        printf("Error: Table '%s' is read-only.\n", ins->table_name);
+        index_free(index);
+        storage_close_table(table);
+        return EXEC_READ_ONLY;
+    }
     if (tst != TABLE_OK) {
         printf("Error: Could not insert row.\n");
         index_free(index);

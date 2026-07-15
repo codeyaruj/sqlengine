@@ -26,6 +26,9 @@ static void consume_rest_ident(const char **pp) {
 
 static void consume_rest_number(const char **pp) {
     const char *p = *pp;
+    if (*p == '-') {
+        p++;
+    }
     while (isdigit((unsigned char)*p)) {
         p++;
     }
@@ -71,7 +74,7 @@ TokenizeStatus tokenize(const char *input, Token *tokens, int max_tokens, int *o
             return TOKENIZE_TOO_MANY_TOKENS;
         }
 
-        token.value[0] = '\0';
+        memset(&token, 0, sizeof(token));
 
         if (*p == ',') {
             token.type = TOKEN_COMMA;
@@ -120,8 +123,12 @@ TokenizeStatus tokenize(const char *input, Token *tokens, int max_tokens, int *o
             }
             p++; /* closing quote */
             token.type = TOKEN_STRING;
-        } else if (isdigit((unsigned char)*p)) {
+        } else if (isdigit((unsigned char)*p) ||
+                   (*p == '-' && isdigit((unsigned char)p[1]))) {
             int i = 0;
+            if (*p == '-') {
+                token.value[i++] = *p++;
+            }
             while (isdigit((unsigned char)*p)) {
                 if (i >= TOKEN_VALUE_MAX) {
                     consume_rest_number(&p);

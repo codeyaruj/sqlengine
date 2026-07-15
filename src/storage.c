@@ -1,9 +1,35 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "storage.h"
 #include "util.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define JOURNAL_MAGIC       0x4A4C5153u /* "SQLJ" little-endian */
+#define JOURNAL_VERSION     1u
+#define JOURNAL_SIZE        128u
+#define JOURNAL_CHECKSUM_AT 108u
+
+static StorageFaultPoint g_storage_fault = STORAGE_FAULT_NONE;
+
+void storage_set_fault_point(StorageFaultPoint point) {
+    g_storage_fault = point;
+}
+
+static int consume_storage_fault(StorageFaultPoint point) {
+    if (g_storage_fault == point) {
+        g_storage_fault = STORAGE_FAULT_NONE;
+        errno = EIO;
+        return 1;
+    }
+    return 0;
+}
 
 /*
  * Table file layout (little-endian, version 1):
@@ -161,15 +187,37 @@ void storage_deserialize_row(const void *src, Row *dest) {
     dest->name[STORAGE_NAME_SIZE - 1] = '\0';
 }
 
-void storage_table_path(const char *table_name, char *buf, size_t buflen) {
-    snprintf(buf, buflen, "%s.tbl", table_name);
+static bool build_path(const char *table_name, const char *suffix, char *buf, size_t buflen) {
+    size_t name_length;
+    size_t suffix_length;
+    size_t needed;
+    if (table_name == NULL || suffix == NULL || buf == NULL || buflen == 0) {
+        return false;
+    }
+    name_length = strlen(table_name);
+    suffix_length = strlen(suffix);
+    if (!util_add_size(name_length, suffix_length, &needed) ||
+        !util_add_size(needed, 1, &needed) || needed > buflen) {
+        return false;
+    }
+    memcpy(buf, table_name, name_length);
+    memcpy(buf + name_length, suffix, suffix_length + 1);
+    return true;
 }
 
-void storage_index_path(const char *table_name, char *buf, size_t buflen) {
-    snprintf(buf, buflen, "%s.idx", table_name);
+bool storage_table_path(const char *table_name, char *buf, size_t buflen) {
+    return build_path(table_name, ".tbl", buf, buflen);
 }
 
-static int valid_table_name(const char *name) {
+bool storage_index_path(const char *table_name, char *buf, size_t buflen) {
+    return build_path(table_name, ".idx", buf, buflen);
+}
+
+bool storage_journal_path(const char *table_name, char *buf, size_t buflen) {
+    return build_path(table_name, ".tbl.journal", buf, buflen);
+}
+
+bool storage_valid_table_name(const char *name) {
     size_t i;
     if (name == NULL || name[0] == '\0') {
         return 0;
@@ -182,11 +230,11 @@ static int valid_table_name(const char *name) {
                c == '_' )) {
             return 0;
         }
-        if (i >= 31) {
-            return 0;
+        if (i >= SQL_MAX_TABLE_NAME_LENGTH) {
+            return false;
         }
     }
-    return 1;
+    return true;
 }
 
 static TableStatus write_header(FILE *f, uint64_t row_count) {
@@ -217,6 +265,200 @@ static TableStatus write_header(FILE *f, uint64_t row_count) {
 
     if (fflush(f) != 0) {
         return TABLE_IO_ERROR;
+    }
+    return TABLE_OK;
+}
+
+static void put_u32_le(unsigned char *dest, uint32_t value) {
+    dest[0] = (unsigned char)(value & 0xFFu);
+    dest[1] = (unsigned char)((value >> 8) & 0xFFu);
+    dest[2] = (unsigned char)((value >> 16) & 0xFFu);
+    dest[3] = (unsigned char)((value >> 24) & 0xFFu);
+}
+
+static void put_u64_le(unsigned char *dest, uint64_t value) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        dest[i] = (unsigned char)((value >> (8 * i)) & 0xFFu);
+    }
+}
+
+static uint32_t get_u32_le(const unsigned char *src) {
+    return (uint32_t)src[0]
+         | ((uint32_t)src[1] << 8)
+         | ((uint32_t)src[2] << 16)
+         | ((uint32_t)src[3] << 24);
+}
+
+static uint64_t get_u64_le(const unsigned char *src) {
+    uint64_t value = 0;
+    int i;
+    for (i = 0; i < 8; i++) {
+        value |= (uint64_t)src[i] << (8 * i);
+    }
+    return value;
+}
+
+static uint32_t journal_checksum(const unsigned char *bytes) {
+    uint32_t hash = 2166136261u;
+    size_t i;
+    for (i = 0; i < JOURNAL_SIZE; i++) {
+        unsigned char byte = (i >= JOURNAL_CHECKSUM_AT && i < JOURNAL_CHECKSUM_AT + 4u)
+                           ? 0u : bytes[i];
+        hash ^= (uint32_t)byte;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static bool storage_logical_size(uint64_t row_count, uint64_t *size) {
+    uint64_t last_offset;
+    if (size == NULL) {
+        return false;
+    }
+    if (row_count == 0) {
+        *size = (uint64_t)STORAGE_HEADER_SIZE;
+        return true;
+    }
+    if (!storage_offset_for_row(row_count - 1, &last_offset)) {
+        return false;
+    }
+    return util_add_u64(last_offset, (uint64_t)STORAGE_ROW_SIZE, size);
+}
+
+static TableStatus persist_insert_journal(const Table *table, const Row *row,
+                                          uint64_t offset, uint64_t new_count) {
+    unsigned char bytes[JOURNAL_SIZE];
+    unsigned char row_bytes[STORAGE_ROW_SIZE];
+    char journal_path[128];
+    char temp_path[160];
+    int fd = -1;
+    FILE *f = NULL;
+    int saved_errno;
+
+    if (!storage_journal_path(table->name, journal_path, sizeof(journal_path))) {
+        return TABLE_DURABILITY_ERROR;
+    }
+    memset(bytes, 0, sizeof(bytes));
+    put_u32_le(bytes, JOURNAL_MAGIC);
+    put_u32_le(bytes + 4, JOURNAL_VERSION);
+    put_u32_le(bytes + 8, JOURNAL_SIZE);
+    put_u64_le(bytes + 16, table->row_count);
+    put_u64_le(bytes + 24, new_count);
+    put_u64_le(bytes + 32, offset);
+    memcpy(bytes + 40, table->name, strlen(table->name));
+    storage_serialize_row(row, row_bytes);
+    memcpy(bytes + 72, row_bytes, sizeof(row_bytes));
+    put_u32_le(bytes + JOURNAL_CHECKSUM_AT, journal_checksum(bytes));
+
+    if (!util_secure_temp_file(journal_path, temp_path, sizeof(temp_path), &fd)) {
+        return (errno == EACCES || errno == EROFS) ? TABLE_READ_ONLY :
+               TABLE_DURABILITY_ERROR;
+    }
+    f = fdopen(fd, "wb");
+    if (f == NULL) {
+        saved_errno = errno;
+        close(fd);
+        unlink(temp_path);
+        errno = saved_errno;
+        return TABLE_DURABILITY_ERROR;
+    }
+    if (fwrite(bytes, 1, sizeof(bytes), f) != sizeof(bytes) || !util_flush_and_sync(f)) {
+        saved_errno = errno;
+        fclose(f);
+        unlink(temp_path);
+        errno = saved_errno;
+        return TABLE_DURABILITY_ERROR;
+    }
+    if (fclose(f) != 0) {
+        saved_errno = errno;
+        unlink(temp_path);
+        errno = saved_errno;
+        return TABLE_DURABILITY_ERROR;
+    }
+    if (rename(temp_path, journal_path) != 0) {
+        saved_errno = errno;
+        unlink(temp_path);
+        errno = saved_errno;
+        return (saved_errno == EACCES || saved_errno == EROFS) ? TABLE_READ_ONLY :
+               TABLE_DURABILITY_ERROR;
+    }
+    if (!util_sync_parent_directory(journal_path)) {
+        return TABLE_DURABILITY_ERROR;
+    }
+    return TABLE_OK;
+}
+
+static TableStatus recover_insert_journal(FILE *table_file, const char *table_name) {
+    unsigned char bytes[JOURNAL_SIZE];
+    char journal_path[128];
+    char stored_name[SQL_TABLE_NAME_CAPACITY];
+    uint32_t checksum;
+    uint64_t previous_count;
+    uint64_t new_count;
+    uint64_t offset;
+    uint64_t expected_offset;
+    uint64_t old_size;
+    off_t truncate_size;
+    int fd;
+    ssize_t amount;
+    unsigned char extra;
+
+    if (!storage_journal_path(table_name, journal_path, sizeof(journal_path))) {
+        return TABLE_DURABILITY_ERROR;
+    }
+    {
+        int flags = O_RDONLY;
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        fd = open(journal_path, flags);
+    }
+    if (fd < 0) {
+        return (errno == ENOENT) ? TABLE_OK : TABLE_DURABILITY_ERROR;
+    }
+    amount = read(fd, bytes, sizeof(bytes));
+    if (amount != (ssize_t)sizeof(bytes) || read(fd, &extra, 1) != 0) {
+        close(fd);
+        return TABLE_CORRUPT;
+    }
+    if (close(fd) != 0) {
+        return TABLE_DURABILITY_ERROR;
+    }
+
+    checksum = get_u32_le(bytes + JOURNAL_CHECKSUM_AT);
+    if (get_u32_le(bytes) != JOURNAL_MAGIC ||
+        get_u32_le(bytes + 4) != JOURNAL_VERSION ||
+        get_u32_le(bytes + 8) != JOURNAL_SIZE ||
+        get_u32_le(bytes + 12) != 0u ||
+        checksum != journal_checksum(bytes)) {
+        return TABLE_CORRUPT;
+    }
+    memcpy(stored_name, bytes + 40, sizeof(stored_name));
+    stored_name[sizeof(stored_name) - 1] = '\0';
+    previous_count = get_u64_le(bytes + 16);
+    new_count = get_u64_le(bytes + 24);
+    offset = get_u64_le(bytes + 32);
+    if (strcmp(stored_name, table_name) != 0 ||
+        !util_add_u64(previous_count, 1, &new_count) ||
+        new_count != get_u64_le(bytes + 24) ||
+        !storage_offset_for_row(previous_count, &expected_offset) || expected_offset != offset ||
+        !storage_logical_size(previous_count, &old_size)) {
+        return TABLE_CORRUPT;
+    }
+    truncate_size = (off_t)old_size;
+    if (truncate_size < 0 || (uint64_t)truncate_size != old_size) {
+        return TABLE_CORRUPT;
+    }
+
+    if (write_header(table_file, previous_count) != TABLE_OK || !util_flush_and_sync(table_file)) {
+        return TABLE_DURABILITY_ERROR;
+    }
+    if (ftruncate(fileno(table_file), truncate_size) != 0 || !util_flush_and_sync(table_file)) {
+        return TABLE_DURABILITY_ERROR;
+    }
+    if (unlink(journal_path) != 0 || !util_sync_parent_directory(journal_path)) {
+        return TABLE_DURABILITY_ERROR;
     }
     return TABLE_OK;
 }
@@ -272,6 +514,9 @@ static TableStatus read_and_validate_header(FILE *f, uint64_t *row_count) {
     if (row_size != STORAGE_ROW_SIZE) {
         return TABLE_INCOMPATIBLE;
     }
+    if (reserved0 != 0u) {
+        return TABLE_CORRUPT;
+    }
 
     /* Reject absurd counts (more than file could hold). */
     rpp = (uint64_t)storage_rows_per_page();
@@ -325,49 +570,86 @@ static TableStatus read_and_validate_header(FILE *f, uint64_t *row_count) {
 
 TableCreateStatus storage_create_table(const char *table_name) {
     char path[96];
+    char journal_path[128];
+    int fd;
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
     FILE *f;
+    int saved_errno;
 
-    if (!valid_table_name(table_name)) {
+    if (table_name != NULL && strlen(table_name) > SQL_MAX_TABLE_NAME_LENGTH) {
+        return TABLE_CREATE_NAME_TOO_LONG;
+    }
+    if (!storage_valid_table_name(table_name)) {
         return TABLE_CREATE_INVALID_NAME;
     }
-
-    storage_table_path(table_name, path, sizeof(path));
-
-    f = fopen(path, "rb");
-    if (f != NULL) {
-        fclose(f);
-        return TABLE_CREATE_ALREADY_EXISTS;
+    if (!storage_table_path(table_name, path, sizeof(path)) ||
+        !storage_journal_path(table_name, journal_path, sizeof(journal_path))) {
+        return TABLE_CREATE_INVALID_NAME;
     }
-
-    f = fopen(path, "wb");
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    fd = open(path, flags, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        return (errno == EEXIST) ? TABLE_CREATE_ALREADY_EXISTS : TABLE_CREATE_IO_ERROR;
+    }
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        saved_errno = errno;
+        close(fd);
+        unlink(path);
+        errno = saved_errno;
+        return TABLE_CREATE_IO_ERROR;
+    }
+    f = fdopen(fd, "wb");
     if (f == NULL) {
+        saved_errno = errno;
+        close(fd);
+        unlink(path);
+        errno = saved_errno;
         return TABLE_CREATE_IO_ERROR;
     }
 
-    if (write_header(f, 0) != TABLE_OK) {
+    if (write_header(f, 0) != TABLE_OK || !util_flush_and_sync(f)) {
+        saved_errno = errno;
         fclose(f);
-        remove(path);
+        unlink(path);
+        errno = saved_errno;
         return TABLE_CREATE_IO_ERROR;
     }
 
     if (fclose(f) != 0) {
-        remove(path);
+        saved_errno = errno;
+        unlink(path);
+        errno = saved_errno;
+        return TABLE_CREATE_IO_ERROR;
+    }
+    if (access(journal_path, F_OK) == 0) {
+        unlink(path);
+        return TABLE_CREATE_IO_ERROR;
+    }
+    if (!util_sync_parent_directory(path)) {
+        saved_errno = errno;
+        unlink(path);
+        errno = saved_errno;
         return TABLE_CREATE_IO_ERROR;
     }
     return TABLE_CREATE_OK;
 }
 
-TableStatus storage_open_table(const char *table_name, Table **out) {
+static TableStatus storage_open_table_mode(const char *table_name, int writable, Table **out) {
     Table *table;
     char path[96];
+    char journal_path[128];
     TableStatus st;
+    int flags;
+    int fd;
 
     if (out == NULL) {
         return TABLE_IO_ERROR;
     }
     *out = NULL;
 
-    if (!valid_table_name(table_name)) {
+    if (!storage_valid_table_name(table_name)) {
         return TABLE_NOT_FOUND;
     }
 
@@ -376,17 +658,48 @@ TableStatus storage_open_table(const char *table_name, Table **out) {
         return TABLE_ALLOC_ERROR;
     }
 
-    strncpy(table->name, table_name, sizeof(table->name) - 1);
-    table->name[sizeof(table->name) - 1] = '\0';
-    storage_table_path(table_name, path, sizeof(path));
-
-    table->file = fopen(path, "rb+");
-    if (table->file == NULL) {
+    if (!util_copy_checked(table->name, sizeof(table->name), table_name) ||
+        !storage_table_path(table_name, path, sizeof(path)) ||
+        !storage_journal_path(table_name, journal_path, sizeof(journal_path))) {
         free(table);
-        if (errno == ENOENT) {
+        return TABLE_IO_ERROR;
+    }
+    flags = writable ? O_RDWR : O_RDONLY;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    fd = open(path, flags);
+    if (fd < 0) {
+        int open_errno = errno;
+        free(table);
+        if (open_errno == ENOENT) {
             return TABLE_NOT_FOUND;
         }
+        if (writable && (open_errno == EACCES || open_errno == EROFS)) {
+            return TABLE_READ_ONLY;
+        }
         return TABLE_IO_ERROR;
+    }
+    table->file = fdopen(fd, writable ? "rb+" : "rb");
+    if (table->file == NULL) {
+        int open_errno = errno;
+        close(fd);
+        free(table);
+        errno = open_errno;
+        return TABLE_IO_ERROR;
+    }
+
+    if (writable) {
+        st = recover_insert_journal(table->file, table_name);
+        if (st != TABLE_OK) {
+            fclose(table->file);
+            free(table);
+            return st;
+        }
+    } else if (access(journal_path, F_OK) == 0) {
+        fclose(table->file);
+        free(table);
+        return TABLE_RECOVERY_REQUIRED;
     }
 
     st = read_and_validate_header(table->file, &table->row_count);
@@ -396,9 +709,17 @@ TableStatus storage_open_table(const char *table_name, Table **out) {
         return st;
     }
 
-    table->header_dirty = 0;
+    table->writable = writable;
     *out = table;
     return TABLE_OK;
+}
+
+TableStatus storage_open_table_readonly(const char *table_name, Table **out) {
+    return storage_open_table_mode(table_name, 0, out);
+}
+
+TableStatus storage_open_table(const char *table_name, Table **out) {
+    return storage_open_table_mode(table_name, 1, out);
 }
 
 void storage_close_table(Table *table) {
@@ -406,9 +727,6 @@ void storage_close_table(Table *table) {
         return;
     }
     if (table->file != NULL) {
-        if (table->header_dirty) {
-            (void)write_header(table->file, table->row_count);
-        }
         fclose(table->file);
     }
     free(table);
@@ -434,39 +752,68 @@ TableStatus storage_insert_row(Table *table, const Row *row, uint64_t *out_offse
     uint64_t offset;
     unsigned char slot[STORAGE_ROW_SIZE];
     uint64_t new_count;
+    char journal_path[128];
 
     if (table == NULL || table->file == NULL || row == NULL) {
         return TABLE_IO_ERROR;
     }
-
-    if (!storage_offset_for_row(table->row_count, &offset)) {
+    if (!table->writable) {
+        return TABLE_READ_ONLY;
+    }
+    if (!storage_offset_for_row(table->row_count, &offset) || offset > (uint64_t)LONG_MAX ||
+        !util_add_u64(table->row_count, 1, &new_count) ||
+        !storage_journal_path(table->name, journal_path, sizeof(journal_path))) {
         return TABLE_IO_ERROR;
     }
 
     storage_serialize_row(row, slot);
 
+    {
+        TableStatus journal_status = persist_insert_journal(table, row, offset, new_count);
+        if (journal_status != TABLE_OK) {
+            return journal_status;
+        }
+    }
+    if (consume_storage_fault(STORAGE_FAULT_BEFORE_ROW_WRITE)) {
+        return TABLE_IO_ERROR;
+    }
+
     if (fseek(table->file, (long)offset, SEEK_SET) != 0) {
+        return TABLE_IO_ERROR;
+    }
+    if (consume_storage_fault(STORAGE_FAULT_DURING_ROW_WRITE)) {
+        (void)fwrite(slot, 1, STORAGE_ROW_SIZE / 2u, table->file);
+        (void)fflush(table->file);
         return TABLE_IO_ERROR;
     }
     if (fwrite(slot, 1, STORAGE_ROW_SIZE, table->file) != STORAGE_ROW_SIZE) {
         return TABLE_IO_ERROR;
     }
-
-    if (!util_add_u64(table->row_count, 1, &new_count)) {
+    if (consume_storage_fault(STORAGE_FAULT_AFTER_ROW_WRITE_BEFORE_SYNC)) {
         return TABLE_IO_ERROR;
     }
+    if (!util_flush_and_sync(table->file)) {
+        return TABLE_DURABILITY_ERROR;
+    }
+    if (consume_storage_fault(STORAGE_FAULT_BEFORE_METADATA_UPDATE)) {
+        return TABLE_IO_ERROR;
+    }
+    if (consume_storage_fault(STORAGE_FAULT_DURING_METADATA_UPDATE)) {
+        unsigned char damaged[2] = {0, 0};
+        if (fseek(table->file, 0, SEEK_SET) == 0) {
+            (void)fwrite(damaged, 1, sizeof(damaged), table->file);
+            (void)fflush(table->file);
+        }
+        return TABLE_IO_ERROR;
+    }
+    if (write_header(table->file, new_count) != TABLE_OK || !util_flush_and_sync(table->file)) {
+        return TABLE_DURABILITY_ERROR;
+    }
+    if (unlink(journal_path) != 0 || !util_sync_parent_directory(journal_path)) {
+        return TABLE_DURABILITY_ERROR;
+    }
+
     table->row_count = new_count;
-    table->header_dirty = 1;
-
-    if (write_header(table->file, table->row_count) != TABLE_OK) {
-        return TABLE_IO_ERROR;
-    }
-    table->header_dirty = 0;
-
-    if (fflush(table->file) != 0) {
-        return TABLE_IO_ERROR;
-    }
-
     if (out_offset != NULL) {
         *out_offset = offset;
     }

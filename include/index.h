@@ -3,11 +3,14 @@
 
 #include "status.h"
 #include "storage.h"
+#include "sql_limits.h"
 
 #include <stdint.h>
 #include <stdio.h>
 
-#define INDEX_SIZE            256
+#define INDEX_INITIAL_BUCKETS 16u
+#define INDEX_MAX_LOAD_NUM    3u
+#define INDEX_MAX_LOAD_DEN    4u
 #define INDEX_MAGIC           0x494C5153u /* "SQLI" little-endian */
 #define INDEX_VERSION         1u
 #define INDEX_HEADER_SIZE     32u
@@ -24,15 +27,25 @@ typedef struct IndexNode {
 } IndexNode;
 
 typedef struct {
-    char table_name[32];
-    IndexNode *buckets[INDEX_SIZE];
+    char table_name[SQL_TABLE_NAME_CAPACITY];
+    IndexNode **buckets;
+    size_t bucket_count;
     size_t entry_count;
 } Index;
+
+typedef enum {
+    INDEX_FAULT_NONE = 0,
+    INDEX_FAULT_DURING_TEMP_WRITE,
+    INDEX_FAULT_BEFORE_RENAME,
+    INDEX_FAULT_AFTER_RENAME_BEFORE_DIR_SYNC
+} IndexFaultPoint;
 
 unsigned int index_hash(int32_t key);
 
 Index *index_create(const char *table_name);
 void index_free(Index *index);
+size_t index_bucket_count(const Index *index);
+void index_set_fault_point(IndexFaultPoint point);
 
 /* Insert or replace. Returns INDEX_DUPLICATE_KEY if key exists and replace==0. */
 IndexStatus index_insert(Index *index, int32_t key, int64_t file_offset, int replace);

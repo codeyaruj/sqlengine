@@ -10,6 +10,9 @@
 #include "util.h"
 
 #include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -207,6 +210,74 @@ static ParseStatus parse_sql(const char *sql, AST *ast) {
         return PARSE_ERROR;
     }
     return parse(tokens, n, ast);
+}
+
+static uint64_t table_row_count(const char *name) {
+    Table *table = NULL;
+    uint64_t count;
+    if (storage_open_table_readonly(name, &table) != TABLE_OK || table == NULL) {
+        g_failures++;
+        return UINT64_MAX;
+    }
+    count = table->row_count;
+    storage_close_table(table);
+    return count;
+}
+
+static int count_secure_temp_files(void) {
+    DIR *directory = opendir(".");
+    struct dirent *entry;
+    int count = 0;
+    if (directory == NULL) {
+        g_failures++;
+        return -1;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        if (strstr(entry->d_name, ".tmp.") != NULL) {
+            count++;
+        }
+    }
+    closedir(directory);
+    return count;
+}
+
+static ExecStatus capture_execute(AST *ast, char *buffer, size_t buffer_size) {
+    int saved_stdout;
+    FILE *capture;
+    ExecStatus status;
+    size_t amount;
+
+    if (buffer == NULL || buffer_size == 0) {
+        g_failures++;
+        return EXEC_UNKNOWN;
+    }
+    fflush(stdout);
+    saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdout < 0) {
+        g_failures++;
+        return EXEC_UNKNOWN;
+    }
+    capture = tmpfile();
+    if (capture == NULL || dup2(fileno(capture), STDOUT_FILENO) < 0) {
+        close(saved_stdout);
+        g_failures++;
+        return EXEC_UNKNOWN;
+    }
+    status = execute(ast);
+    fflush(stdout);
+    if (dup2(saved_stdout, STDOUT_FILENO) < 0) {
+        g_failures++;
+    }
+    close(saved_stdout);
+    if (fseek(capture, 0, SEEK_SET) != 0) {
+        fclose(capture);
+        g_failures++;
+        return EXEC_UNKNOWN;
+    }
+    amount = fread(buffer, 1, buffer_size - 1, capture);
+    buffer[amount] = '\0';
+    fclose(capture);
+    return status;
 }
 
 static void test_parser_valid(void) {
@@ -737,6 +808,414 @@ static void test_layout_helpers(void) {
     test_end();
 }
 
+static void test_secure_files_and_atomic_creation(void) {
+    struct stat st;
+    FILE *victim;
+    char contents[16] = {0};
+    Index *index;
+    Table *table = NULL;
+    Row row;
+
+    test_begin("secure temp files and atomic table creation");
+    reset_workdir();
+    ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_OK);
+    ASSERT_EQ_INT(stat("users.tbl", &st), 0);
+    ASSERT_EQ_INT((int)(st.st_mode & 0777), 0600);
+
+    memset(&row, 0, sizeof(row));
+    row.id = 1;
+    strcpy(row.name, "original");
+    ASSERT_EQ_INT(storage_open_table("users", &table), TABLE_OK);
+    ASSERT_EQ_INT(storage_insert_row(table, &row, NULL), TABLE_OK);
+    storage_close_table(table);
+    ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_ALREADY_EXISTS);
+    ASSERT_EQ_INT((int)table_row_count("users"), 1);
+
+    victim = fopen("victim", "wb");
+    ASSERT_TRUE(victim != NULL);
+    ASSERT_EQ_INT((int)fwrite("UNCHANGED", 1, 9, victim), 9);
+    fclose(victim);
+    ASSERT_EQ_INT(symlink("victim", "users.idx.tmp"), 0);
+
+    ASSERT_EQ_INT(index_rebuild("users"), INDEX_OK);
+    victim = fopen("victim", "rb");
+    ASSERT_TRUE(victim != NULL);
+    ASSERT_EQ_INT((int)fread(contents, 1, sizeof(contents) - 1, victim), 9);
+    fclose(victim);
+    ASSERT_STREQ(contents, "UNCHANGED");
+    ASSERT_EQ_INT(lstat("users.idx.tmp", &st), 0);
+    ASSERT_TRUE(S_ISLNK(st.st_mode));
+    ASSERT_EQ_INT(stat("users.idx", &st), 0);
+    ASSERT_EQ_INT((int)(st.st_mode & 0777), 0600);
+
+    index = index_create("users");
+    ASSERT_TRUE(index != NULL);
+    ASSERT_EQ_INT(index_insert(index, 1, (int64_t)STORAGE_HEADER_SIZE, 0), INDEX_OK);
+    index_set_fault_point(INDEX_FAULT_DURING_TEMP_WRITE);
+    ASSERT_TRUE(index_persist(index) != INDEX_OK);
+    ASSERT_EQ_INT(count_secure_temp_files(), 0);
+    index_set_fault_point(INDEX_FAULT_BEFORE_RENAME);
+    ASSERT_TRUE(index_persist(index) != INDEX_OK);
+    ASSERT_EQ_INT(count_secure_temp_files(), 0);
+    index_set_fault_point(INDEX_FAULT_AFTER_RENAME_BEFORE_DIR_SYNC);
+    ASSERT_TRUE(index_persist(index) != INDEX_OK);
+    {
+        Index *loaded = NULL;
+        ASSERT_EQ_INT(index_load("users", &loaded), INDEX_OK);
+        ASSERT_TRUE(loaded != NULL);
+        index_free(loaded);
+    }
+    index_free(index);
+    test_end();
+}
+
+static void test_checked_sql_lengths(void) {
+    char valid_name[SQL_TABLE_NAME_CAPACITY];
+    char invalid_name[SQL_TABLE_NAME_CAPACITY + 1u];
+    char valid_value[SQL_STORED_NAME_CAPACITY];
+    char invalid_value[SQL_STORED_NAME_CAPACITY + 1u];
+    char sql[256];
+    AST ast;
+    Table *table = NULL;
+    Row *rows = NULL;
+    uint64_t count = 0;
+    struct stat index_before;
+    struct stat index_after;
+
+    test_begin("checked SQL identifier and value lengths");
+    reset_workdir();
+    memset(valid_name, 'a', SQL_MAX_TABLE_NAME_LENGTH);
+    valid_name[SQL_MAX_TABLE_NAME_LENGTH] = '\0';
+    memset(invalid_name, 'a', SQL_TABLE_NAME_CAPACITY);
+    invalid_name[SQL_TABLE_NAME_CAPACITY] = '\0';
+    memset(valid_value, 'v', SQL_MAX_STORED_NAME_LENGTH);
+    valid_value[SQL_MAX_STORED_NAME_LENGTH] = '\0';
+    memset(invalid_value, 'v', SQL_STORED_NAME_CAPACITY);
+    invalid_value[SQL_STORED_NAME_CAPACITY] = '\0';
+
+    ASSERT_EQ_INT(storage_create_table(valid_name), TABLE_CREATE_OK);
+    ASSERT_EQ_INT(storage_create_table(invalid_name), TABLE_CREATE_NAME_TOO_LONG);
+    ASSERT_EQ_INT(index_rebuild(valid_name), INDEX_OK);
+    {
+        char index_path[96];
+        ASSERT_TRUE(storage_index_path(valid_name, index_path, sizeof(index_path)));
+        ASSERT_EQ_INT(stat(index_path, &index_before), 0);
+    }
+    snprintf(sql, sizeof(sql), "SELECT * FROM %s;", valid_name);
+    ASSERT_EQ_INT(parse_sql(sql, &ast), PARSE_OK);
+    snprintf(sql, sizeof(sql), "SELECT * FROM %s;", invalid_name);
+    ASSERT_EQ_INT(parse_sql(sql, &ast), PARSE_TABLE_NAME_TOO_LONG);
+
+    snprintf(sql, sizeof(sql), "INSERT INTO %s VALUES (1, \"%s\");",
+             valid_name, invalid_value);
+    ASSERT_EQ_INT(parse_sql(sql, &ast), PARSE_STRING_TOO_LONG);
+    ASSERT_EQ_INT((int)table_row_count(valid_name), 0);
+
+    snprintf(sql, sizeof(sql), "INSERT INTO %s VALUES (1, \"short\");", invalid_name);
+    ASSERT_EQ_INT(parse_sql(sql, &ast), PARSE_TABLE_NAME_TOO_LONG);
+    ASSERT_EQ_INT((int)table_row_count(valid_name), 0);
+    {
+        char index_path[96];
+        ASSERT_TRUE(storage_index_path(valid_name, index_path, sizeof(index_path)));
+        ASSERT_EQ_INT(stat(index_path, &index_after), 0);
+        ASSERT_EQ_INT((int)index_before.st_size, (int)index_after.st_size);
+    }
+
+    snprintf(sql, sizeof(sql), "INSERT INTO %s VALUES (1, \"%s\");",
+             valid_name, valid_value);
+    ASSERT_EQ_INT(parse_sql(sql, &ast), PARSE_OK);
+    ASSERT_EQ_INT(execute(&ast), EXEC_OK);
+    ASSERT_EQ_INT(storage_open_table_readonly(valid_name, &table), TABLE_OK);
+    ASSERT_EQ_INT(storage_select_all_rows(table, &rows, &count), TABLE_OK);
+    ASSERT_EQ_INT((int)count, 1);
+    ASSERT_EQ_INT((int)strlen(rows[0].name), SQL_MAX_STORED_NAME_LENGTH);
+    ASSERT_STREQ(rows[0].name, valid_value);
+    free(rows);
+    storage_close_table(table);
+    test_end();
+}
+
+static void test_dynamic_hash_and_index_bounds(void) {
+    Index *index;
+    Table *table = NULL;
+    Row row;
+    int i;
+    int64_t offset;
+    FILE *f;
+
+    test_begin("dynamic hash and authoritative index bounds");
+    reset_workdir();
+    ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_OK);
+    index = index_create("users");
+    ASSERT_TRUE(index != NULL);
+    for (i = 0; i < 2000; i++) {
+        ASSERT_EQ_INT(index_insert(index, (int32_t)(i * 256), (int64_t)i, 0), INDEX_OK);
+    }
+    ASSERT_TRUE(index_bucket_count(index) > INDEX_INITIAL_BUCKETS);
+    for (i = 0; i < 2000; i++) {
+        ASSERT_EQ_INT(index_lookup(index, (int32_t)(i * 256), &offset), INDEX_OK);
+        ASSERT_EQ_INT((int)offset, i);
+    }
+    index_free(index);
+
+    ASSERT_EQ_INT(storage_open_table("users", &table), TABLE_OK);
+    for (i = 0; i < 128; i++) {
+        memset(&row, 0, sizeof(row));
+        row.id = (int32_t)(i * 256);
+        snprintf(row.name, sizeof(row.name), "row%d", i);
+        ASSERT_EQ_INT(storage_insert_row(table, &row, NULL), TABLE_OK);
+    }
+    storage_close_table(table);
+    ASSERT_EQ_INT(index_rebuild("users"), INDEX_OK);
+    ASSERT_EQ_INT(index_load("users", &index), INDEX_OK);
+    ASSERT_TRUE(index_bucket_count(index) > INDEX_INITIAL_BUCKETS);
+    for (i = 0; i < 128; i++) {
+        ASSERT_EQ_INT(index_lookup(index, (int32_t)(i * 256), &offset), INDEX_OK);
+    }
+    index_free(index);
+
+    f = fopen("users.idx", "wb");
+    ASSERT_TRUE(f != NULL);
+    util_write_u32_le(f, INDEX_MAGIC);
+    util_write_u32_le(f, INDEX_VERSION);
+    util_write_u32_le(f, INDEX_HEADER_SIZE);
+    util_write_u32_le(f, INDEX_ENTRY_ONDISK);
+    util_write_u32_le(f, 129);
+    util_write_u32_le(f, 0);
+    {
+        unsigned char pad[8] = {0};
+        fwrite(pad, 1, sizeof(pad), f);
+    }
+    fclose(f);
+    ASSERT_EQ_INT(index_load("users", &index), INDEX_CORRUPT);
+
+    f = fopen("users.idx", "wb");
+    ASSERT_TRUE(f != NULL);
+    util_write_u32_le(f, INDEX_MAGIC);
+    util_write_u32_le(f, INDEX_VERSION);
+    util_write_u32_le(f, INDEX_HEADER_SIZE);
+    util_write_u32_le(f, INDEX_ENTRY_ONDISK);
+    util_write_u32_le(f, UINT32_MAX);
+    util_write_u32_le(f, 0);
+    {
+        unsigned char pad[8] = {0};
+        fwrite(pad, 1, sizeof(pad), f);
+    }
+    fclose(f);
+    ASSERT_EQ_INT(index_load("users", &index), INDEX_CORRUPT);
+    test_end();
+}
+
+static void test_duplicate_rebuild_detection(void) {
+    Table *table = NULL;
+    Row row;
+    struct stat before;
+    struct stat after;
+    Index *index = NULL;
+    AST ast;
+    char output[512];
+
+    test_begin("duplicate primary key detection during rebuild");
+    reset_workdir();
+    ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_OK);
+    memset(&row, 0, sizeof(row));
+    row.id = 7;
+    strcpy(row.name, "first");
+    ASSERT_EQ_INT(storage_open_table("users", &table), TABLE_OK);
+    ASSERT_EQ_INT(storage_insert_row(table, &row, NULL), TABLE_OK);
+    storage_close_table(table);
+    ASSERT_EQ_INT(index_rebuild("users"), INDEX_OK);
+    ASSERT_EQ_INT(stat("users.idx", &before), 0);
+
+    strcpy(row.name, "second");
+    ASSERT_EQ_INT(storage_open_table("users", &table), TABLE_OK);
+    ASSERT_EQ_INT(storage_insert_row(table, &row, NULL), TABLE_OK);
+    storage_close_table(table);
+    ASSERT_EQ_INT(index_rebuild("users"), INDEX_DUPLICATE_PRIMARY_KEY);
+    ASSERT_EQ_INT(stat("users.idx", &after), 0);
+    ASSERT_EQ_INT((int)before.st_size, (int)after.st_size);
+    ASSERT_EQ_INT(index_load("users", &index), INDEX_CORRUPT);
+    ASSERT_TRUE(index == NULL);
+    ASSERT_EQ_INT(parse_sql("SELECT * FROM users WHERE id = 7;", &ast), PARSE_OK);
+    ASSERT_EQ_INT(capture_execute(&ast, output, sizeof(output)), EXEC_TABLE_CORRUPT);
+    ASSERT_TRUE(strstr(output, "duplicate primary keys") != NULL);
+    test_end();
+}
+
+static void test_insert_crash_recovery(void) {
+    const StorageFaultPoint points[] = {
+        STORAGE_FAULT_BEFORE_ROW_WRITE,
+        STORAGE_FAULT_DURING_ROW_WRITE,
+        STORAGE_FAULT_AFTER_ROW_WRITE_BEFORE_SYNC,
+        STORAGE_FAULT_BEFORE_METADATA_UPDATE,
+        STORAGE_FAULT_DURING_METADATA_UPDATE
+    };
+    size_t i;
+
+    test_begin("insert rollback journal fault recovery");
+    for (i = 0; i < sizeof(points) / sizeof(points[0]); i++) {
+        Table *table = NULL;
+        Row row;
+        char journal_path[128];
+        reset_workdir();
+        ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_OK);
+        memset(&row, 0, sizeof(row));
+        row.id = 9;
+        strcpy(row.name, "journaled");
+        ASSERT_EQ_INT(storage_open_table("users", &table), TABLE_OK);
+        storage_set_fault_point(points[i]);
+        ASSERT_TRUE(storage_insert_row(table, &row, NULL) != TABLE_OK);
+        storage_close_table(table);
+        ASSERT_TRUE(storage_journal_path("users", journal_path, sizeof(journal_path)));
+        ASSERT_EQ_INT(access(journal_path, F_OK), 0);
+
+        ASSERT_EQ_INT(storage_open_table("users", &table), TABLE_OK);
+        ASSERT_EQ_INT((int)table->row_count, 0);
+        storage_close_table(table);
+        ASSERT_TRUE(access(journal_path, F_OK) != 0 && errno == ENOENT);
+        ASSERT_EQ_INT((int)table_row_count("users"), 0);
+    }
+    test_end();
+}
+
+static void test_terminal_escaping(void) {
+    unsigned char field[STORAGE_NAME_SIZE];
+    FILE *capture;
+    char output[256];
+    size_t amount;
+    Table *table = NULL;
+    Row row;
+    AST ast;
+    char query_output[1024];
+
+    test_begin("terminal-safe stored value escaping");
+    reset_workdir();
+    memset(field, 0, sizeof(field));
+    field[0] = 'A';
+    field[1] = 0x1Bu;
+    memcpy(field + 2, "[31m", 4);
+    field[6] = '\n';
+    field[7] = '\r';
+    field[8] = '\t';
+    field[9] = 0x7Fu;
+    memcpy(field + 10, "%s%n", 4);
+    field[14] = 0;
+    field[15] = 'X';
+    capture = tmpfile();
+    ASSERT_TRUE(capture != NULL);
+    ASSERT_TRUE(util_print_escaped_field(capture, field, sizeof(field)));
+    rewind(capture);
+    amount = fread(output, 1, sizeof(output) - 1, capture);
+    output[amount] = '\0';
+    fclose(capture);
+    ASSERT_TRUE(strchr(output, '\x1b') == NULL);
+    ASSERT_TRUE(strstr(output, "\\x1B[31m\\n\\r\\t\\x7F%s%n\\x00X") != NULL);
+
+    ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_OK);
+    memset(&row, 0, sizeof(row));
+    row.id = 1;
+    memcpy(row.name, field, sizeof(row.name));
+    ASSERT_EQ_INT(storage_open_table("users", &table), TABLE_OK);
+    ASSERT_EQ_INT(storage_insert_row(table, &row, NULL), TABLE_OK);
+    storage_close_table(table);
+    ASSERT_EQ_INT(parse_sql("SELECT * FROM users;", &ast), PARSE_OK);
+    ASSERT_EQ_INT(capture_execute(&ast, query_output, sizeof(query_output)), EXEC_OK);
+    ASSERT_TRUE(strchr(query_output, '\x1b') == NULL);
+    ASSERT_TRUE(strstr(query_output, "\\x1B") != NULL);
+    test_end();
+}
+
+static void test_read_only_select_and_index_fallback(void) {
+    AST ast;
+    char output[1024];
+
+    test_begin("read-only SELECT and missing-index fallback");
+    reset_workdir();
+    ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_OK);
+    ASSERT_EQ_INT(parse_sql("INSERT INTO users VALUES (1, \"readable\");", &ast), PARSE_OK);
+    ASSERT_EQ_INT(execute(&ast), EXEC_OK);
+    ASSERT_EQ_INT(unlink("users.idx"), 0);
+    ASSERT_EQ_INT(chmod("users.tbl", 0400), 0);
+    ASSERT_EQ_INT(parse_sql("SELECT * FROM users WHERE id = 1;", &ast), PARSE_OK);
+    ASSERT_EQ_INT(capture_execute(&ast, output, sizeof(output)), EXEC_OK);
+    ASSERT_TRUE(strstr(output, "readable") != NULL);
+    ASSERT_EQ_INT(parse_sql("INSERT INTO users VALUES (2, \"blocked\");", &ast), PARSE_OK);
+    ASSERT_EQ_INT(capture_execute(&ast, output, sizeof(output)), EXEC_READ_ONLY);
+
+    ASSERT_TRUE(unlink("users.idx") == 0 || errno == ENOENT);
+    ASSERT_EQ_INT(chmod(".", 0500), 0);
+    ASSERT_EQ_INT(parse_sql("SELECT * FROM users WHERE id = 1;", &ast), PARSE_OK);
+    ASSERT_EQ_INT(capture_execute(&ast, output, sizeof(output)), EXEC_OK);
+    ASSERT_TRUE(strstr(output, "readable") != NULL);
+    ASSERT_EQ_INT(chmod(".", 0700), 0);
+    ASSERT_EQ_INT(chmod("users.tbl", 0600), 0);
+    test_end();
+}
+
+static void test_signed_int32_ids(void) {
+    Token tokens[32];
+    int token_count = 0;
+    AST ast;
+    char output[1024];
+
+    test_begin("signed int32 IDs and boundaries");
+    reset_workdir();
+    ASSERT_EQ_INT(tokenize("INSERT INTO users VALUES (-1, \"negative\");",
+                           tokens, 32, &token_count), TOKENIZE_OK);
+    ASSERT_STREQ(tokens[5].value, "-1");
+    ASSERT_EQ_INT(storage_create_table("users"), TABLE_CREATE_OK);
+    ASSERT_EQ_INT(parse(tokens, token_count, &ast), PARSE_OK);
+    ASSERT_EQ_INT(execute(&ast), EXEC_OK);
+    ASSERT_EQ_INT(parse_sql("INSERT INTO users VALUES (-2147483648, \"min\");", &ast), PARSE_OK);
+    ASSERT_EQ_INT(execute(&ast), EXEC_OK);
+    ASSERT_EQ_INT(parse_sql("INSERT INTO users VALUES (2147483647, \"max\");", &ast), PARSE_OK);
+    ASSERT_EQ_INT(execute(&ast), EXEC_OK);
+    ASSERT_EQ_INT(parse_sql("SELECT * FROM users WHERE id = -1;", &ast), PARSE_OK);
+    ASSERT_EQ_INT(capture_execute(&ast, output, sizeof(output)), EXEC_OK);
+    ASSERT_TRUE(strstr(output, "negative") != NULL);
+    ASSERT_EQ_INT(parse_sql("INSERT INTO users VALUES (-2147483649, \"bad\");", &ast),
+                  PARSE_INTEGER_OUT_OF_RANGE);
+    ASSERT_EQ_INT(parse_sql("INSERT INTO users VALUES (2147483648, \"bad\");", &ast),
+                  PARSE_INTEGER_OUT_OF_RANGE);
+    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = -;", tokens, 32, &token_count) != TOKENIZE_OK);
+    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = --1;", tokens, 32, &token_count) != TOKENIZE_OK);
+    ASSERT_TRUE(tokenize("SELECT * FROM users WHERE id = -abc;", tokens, 32, &token_count) != TOKENIZE_OK);
+    ASSERT_TRUE(parse_sql("SELECT * FROM users WHERE id = 1-2;", &ast) != PARSE_OK);
+    test_end();
+}
+
+static void test_parser_truncated_arrays(void) {
+    static const char *statements[] = {
+        "SELECT", "SELECT *", "SELECT * FROM", "SELECT * FROM users WHERE",
+        "SELECT * FROM users WHERE id", "SELECT * FROM users WHERE id =",
+        "INSERT", "INSERT INTO", "INSERT INTO users", "INSERT INTO users VALUES",
+        "INSERT INTO users VALUES (", "INSERT INTO users VALUES (1",
+        "INSERT INTO users VALUES (1,"
+    };
+    Token no_eof[3] = {
+        {TOKEN_SELECT, "SELECT"},
+        {TOKEN_STAR, "*"},
+        {TOKEN_FROM, "FROM"}
+    };
+    Parser parser;
+    AST ast;
+    size_t i;
+
+    test_begin("parser truncated arrays and missing EOF");
+    for (i = 0; i < sizeof(statements) / sizeof(statements[0]); i++) {
+        ASSERT_TRUE(parse_sql(statements[i], &ast) != PARSE_OK);
+    }
+    ASSERT_EQ_INT(parse(no_eof, 0, &ast), PARSE_NULL_INPUT);
+    ASSERT_TRUE(parse(no_eof, 1, &ast) != PARSE_OK);
+    ASSERT_TRUE(parse(no_eof, 3, &ast) != PARSE_OK);
+    ASSERT_TRUE(parse(no_eof, 2, &ast) != PARSE_OK);
+    parser_init(&parser, no_eof, 2);
+    parser.pos = 3;
+    ASSERT_EQ_INT(parser_peek(&parser)->type, TOKEN_EOF);
+    ASSERT_EQ_INT(parser_previous(&parser)->type, TOKEN_EOF);
+    test_end();
+}
+
 int main(void) {
     char template[] = "/tmp/sqlengine_test_XXXXXX";
     char *dir;
@@ -786,6 +1265,16 @@ int main(void) {
     test_cli_oversized_input();
     test_case_insensitive_sql_exec();
     test_invalid_insert_numbers();
+
+    test_secure_files_and_atomic_creation();
+    test_checked_sql_lengths();
+    test_dynamic_hash_and_index_bounds();
+    test_duplicate_rebuild_detection();
+    test_insert_crash_recovery();
+    test_terminal_escaping();
+    test_read_only_select_and_index_fallback();
+    test_signed_int32_ids();
+    test_parser_truncated_arrays();
 
     chdir(g_home);
     {

@@ -2,6 +2,7 @@
 #define PARSER_H
 
 #include "status.h"
+#include "sql_limits.h"
 #include "tokenizer.h"
 
 #include <stdbool.h>
@@ -22,20 +23,20 @@ typedef enum {
 } LiteralType;
 
 typedef struct {
-    char table_name[32];
+    char table_name[SQL_TABLE_NAME_CAPACITY];
     int select_all;
     int column_count;
-    char columns[MAX_COLUMNS][32];
+    char columns[MAX_COLUMNS][SQL_IDENTIFIER_CAPACITY];
     int has_where;
-    char where_column[32];
-    char where_value[64];
+    char where_column[SQL_IDENTIFIER_CAPACITY];
+    char where_value[SQL_STORED_NAME_CAPACITY];
     LiteralType where_value_type;
 } SelectQuery;
 
 typedef struct {
-    char table_name[32];
+    char table_name[SQL_TABLE_NAME_CAPACITY];
     int32_t id;
-    char name[32];
+    char name[SQL_STORED_NAME_CAPACITY];
 } InsertQuery;
 
 typedef struct {

@@ -12,6 +12,9 @@ bool util_add_size(size_t a, size_t b, size_t *out);
 bool util_mul_u64(uint64_t a, uint64_t b, uint64_t *out);
 bool util_add_u64(uint64_t a, uint64_t b, uint64_t *out);
 
+/* Copy a complete C string. Returns false instead of truncating. */
+bool util_copy_checked(char *destination, size_t destination_size, const char *source);
+
 /* Parse a full token as int32. Rejects partial consumption and out-of-range. */
 bool util_parse_int32(const char *text, int32_t *out);
 
@@ -31,5 +34,13 @@ int util_strncasecmp(const char *a, const char *b, size_t n);
 
 /* True if c is a word boundary for SQL keyword detection. */
 bool util_is_word_boundary(char c);
+
+/* POSIX durability and secure same-directory temporary-file helpers. */
+bool util_secure_temp_file(const char *destination, char *path, size_t path_size, int *fd);
+bool util_flush_and_sync(FILE *f);
+bool util_sync_parent_directory(const char *path);
+
+/* Escape an on-disk fixed-width string field for safe terminal output. */
+bool util_print_escaped_field(FILE *out, const unsigned char *bytes, size_t size);
 
 #endif

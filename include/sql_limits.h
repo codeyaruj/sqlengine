@@ -1,0 +1,12 @@
+#ifndef SQL_LIMITS_H
+#define SQL_LIMITS_H
+
+/* Capacities include the terminating NUL used by in-memory C strings. */
+#define SQL_TABLE_NAME_CAPACITY 32u
+#define SQL_IDENTIFIER_CAPACITY 32u
+#define SQL_STORED_NAME_CAPACITY 32u
+#define SQL_MAX_TABLE_NAME_LENGTH (SQL_TABLE_NAME_CAPACITY - 1u)
+#define SQL_MAX_IDENTIFIER_LENGTH (SQL_IDENTIFIER_CAPACITY - 1u)
+#define SQL_MAX_STORED_NAME_LENGTH (SQL_STORED_NAME_CAPACITY - 1u)
+
+#endif

@@ -59,6 +59,9 @@ static void handle_meta_command(const char *input) {
             printf("Table '%s' already exists.\n", arg);
         } else if (st == TABLE_CREATE_INVALID_NAME) {
             printf("Error: Invalid table name '%s'.\n", arg);
+        } else if (st == TABLE_CREATE_NAME_TOO_LONG) {
+            printf("Error: Table name '%s' is too long (maximum %u bytes).\n",
+                   arg, (unsigned int)SQL_MAX_TABLE_NAME_LENGTH);
         } else {
             printf("Error: Could not create table '%s' (%s).\n",
                    arg, table_create_status_string(st));

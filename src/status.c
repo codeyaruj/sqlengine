@@ -19,6 +19,10 @@ const char *parse_status_string(ParseStatus s) {
         case PARSE_TRAILING_TOKENS: return "trailing tokens after statement";
         case PARSE_UNEXPECTED_EOF: return "unexpected end of input";
         case PARSE_NULL_INPUT: return "null input";
+        case PARSE_TABLE_NAME_TOO_LONG: return "table name too long";
+        case PARSE_IDENTIFIER_TOO_LONG: return "identifier too long";
+        case PARSE_STRING_TOO_LONG: return "string value too long";
+        case PARSE_INTEGER_OUT_OF_RANGE: return "integer outside int32 range";
         default: return "unknown parse error";
     }
 }
@@ -39,6 +43,7 @@ const char *table_create_status_string(TableCreateStatus s) {
         case TABLE_CREATE_ALREADY_EXISTS: return "already exists";
         case TABLE_CREATE_IO_ERROR: return "I/O error";
         case TABLE_CREATE_INVALID_NAME: return "invalid name";
+        case TABLE_CREATE_NAME_TOO_LONG: return "table name too long";
         default: return "unknown create error";
     }
 }
@@ -69,6 +74,9 @@ const char *index_status_string(IndexStatus s) {
         case INDEX_KEY_MISMATCH: return "key mismatch";
         case INDEX_DUPLICATE_KEY: return "duplicate key";
         case INDEX_PERSIST_ERROR: return "persist error";
+        case INDEX_DUPLICATE_PRIMARY_KEY: return "duplicate primary key in table";
+        case INDEX_TEMPFILE_ERROR: return "secure temporary-file error";
+        case INDEX_READ_ONLY: return "read-only filesystem";
         default: return "unknown index error";
     }
 }
@@ -85,6 +93,7 @@ const char *exec_status_string(ExecStatus s) {
         case EXEC_INDEX_ERROR: return "index error";
         case EXEC_INDEX_PERSIST_FAILED: return "index persist failed";
         case EXEC_ALLOC_ERROR: return "allocation failure";
+        case EXEC_READ_ONLY: return "read-only table";
         case EXEC_UNKNOWN: return "unknown error";
         default: return "unknown execution error";
     }
