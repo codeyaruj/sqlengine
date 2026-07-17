@@ -32,15 +32,18 @@ unsigned int index_hash(int32_t key) {
     return (unsigned int)value;
 }
 
+static size_t index_load_limit(size_t bucket_count) {
+    return (bucket_count / INDEX_MAX_LOAD_DEN) * INDEX_MAX_LOAD_NUM;
+}
+
 static bool bucket_count_for_entries(size_t expected_entries, size_t *out) {
     size_t buckets = INDEX_INITIAL_BUCKETS;
-    size_t threshold;
+
     if (out == NULL) {
         return false;
     }
     for (;;) {
-        threshold = (buckets / INDEX_MAX_LOAD_DEN) * INDEX_MAX_LOAD_NUM;
-        if (expected_entries <= threshold) {
+        if (expected_entries <= index_load_limit(buckets)) {
             *out = buckets;
             return true;
         }
@@ -101,7 +104,10 @@ void index_free(Index *index) {
 }
 
 size_t index_bucket_count(const Index *index) {
-    return (index == NULL) ? 0 : index->bucket_count;
+    if (index == NULL) {
+        return 0;
+    }
+    return index->bucket_count;
 }
 
 static IndexStatus index_resize(Index *index, size_t new_count) {
@@ -136,7 +142,6 @@ static IndexStatus index_resize(Index *index, size_t new_count) {
 
 IndexStatus index_insert(Index *index, int32_t key, int64_t file_offset, int replace) {
     size_t bucket;
-    size_t threshold;
     IndexNode *node;
     IndexNode *new_node;
 
@@ -154,8 +159,7 @@ IndexStatus index_insert(Index *index, int32_t key, int64_t file_offset, int rep
         }
     }
 
-    threshold = (index->bucket_count / INDEX_MAX_LOAD_DEN) * INDEX_MAX_LOAD_NUM;
-    if (index->entry_count >= threshold) {
+    if (index->entry_count >= index_load_limit(index->bucket_count)) {
         if (index->bucket_count > SIZE_MAX / 2u) {
             return INDEX_ALLOC_ERROR;
         }
@@ -194,12 +198,44 @@ IndexStatus index_lookup(const Index *index, int32_t key, int64_t *out_offset) {
     return INDEX_NOT_FOUND;
 }
 
+static bool write_index_header(FILE *file, uint32_t entry_count) {
+    unsigned char padding[INDEX_HEADER_SIZE - 24u];
+
+    if (!util_write_u32_le(file, INDEX_MAGIC) ||
+        !util_write_u32_le(file, INDEX_VERSION) ||
+        !util_write_u32_le(file, INDEX_HEADER_SIZE) ||
+        !util_write_u32_le(file, INDEX_ENTRY_ONDISK) ||
+        !util_write_u32_le(file, entry_count) ||
+        !util_write_u32_le(file, 0u)) {
+        return false;
+    }
+
+    memset(padding, 0, sizeof(padding));
+    return fwrite(padding, 1, sizeof(padding), file) == sizeof(padding);
+}
+
+static bool write_index_entries(FILE *file, const Index *index) {
+    size_t i;
+
+    for (i = 0; i < index->bucket_count; i++) {
+        IndexNode *node = index->buckets[i];
+
+        while (node != NULL) {
+            if (!util_write_i32_le(file, node->entry.key) ||
+                !util_write_i64_le(file, node->entry.file_offset)) {
+                return false;
+            }
+            node = node->next;
+        }
+    }
+    return true;
+}
+
 IndexStatus index_persist(const Index *index) {
     char path[96];
     char temp_path[128];
     int fd = -1;
     FILE *f = NULL;
-    size_t i;
     uint32_t count;
     int saved_errno;
 
@@ -208,7 +244,10 @@ IndexStatus index_persist(const Index *index) {
         return INDEX_PERSIST_ERROR;
     }
     if (!util_secure_temp_file(path, temp_path, sizeof(temp_path), &fd)) {
-        return (errno == EACCES || errno == EROFS) ? INDEX_READ_ONLY : INDEX_TEMPFILE_ERROR;
+        if (errno == EACCES || errno == EROFS) {
+            return INDEX_READ_ONLY;
+        }
+        return INDEX_TEMPFILE_ERROR;
     }
     f = fdopen(fd, "wb");
     if (f == NULL) {
@@ -219,32 +258,14 @@ IndexStatus index_persist(const Index *index) {
         return INDEX_TEMPFILE_ERROR;
     }
     count = (uint32_t)index->entry_count;
-    if (!util_write_u32_le(f, INDEX_MAGIC) ||
-        !util_write_u32_le(f, INDEX_VERSION) ||
-        !util_write_u32_le(f, INDEX_HEADER_SIZE) ||
-        !util_write_u32_le(f, INDEX_ENTRY_ONDISK) ||
-        !util_write_u32_le(f, count) ||
-        !util_write_u32_le(f, 0u)) {
+    if (!write_index_header(f, count)) {
         goto temp_failure;
-    }
-    {
-        unsigned char padding[INDEX_HEADER_SIZE - 24u];
-        memset(padding, 0, sizeof(padding));
-        if (fwrite(padding, 1, sizeof(padding), f) != sizeof(padding)) {
-            goto temp_failure;
-        }
     }
     if (consume_index_fault(INDEX_FAULT_DURING_TEMP_WRITE)) {
         goto temp_failure;
     }
-    for (i = 0; i < index->bucket_count; i++) {
-        IndexNode *node;
-        for (node = index->buckets[i]; node != NULL; node = node->next) {
-            if (!util_write_i32_le(f, node->entry.key) ||
-                !util_write_i64_le(f, node->entry.file_offset)) {
-                goto temp_failure;
-            }
-        }
+    if (!write_index_entries(f, index)) {
+        goto temp_failure;
     }
     if (!util_flush_and_sync(f)) {
         goto temp_failure;
@@ -287,17 +308,60 @@ temp_failure:
     return INDEX_PERSIST_ERROR;
 }
 
+static IndexStatus read_index_header(FILE *file, uint64_t file_size,
+                                     uint64_t table_row_count,
+                                     uint32_t *out_entry_count) {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t header_size;
+    uint32_t entry_size;
+    uint32_t entry_count;
+    uint32_t reserved;
+    uint64_t entries_size;
+    uint64_t expected_size;
+
+    if (!util_read_u32_le(file, &magic) ||
+        !util_read_u32_le(file, &version) ||
+        !util_read_u32_le(file, &header_size) ||
+        !util_read_u32_le(file, &entry_size) ||
+        !util_read_u32_le(file, &entry_count) ||
+        !util_read_u32_le(file, &reserved)) {
+        return INDEX_CORRUPT;
+    }
+    if (magic != INDEX_MAGIC ||
+        version != INDEX_VERSION ||
+        header_size != INDEX_HEADER_SIZE ||
+        entry_size != INDEX_ENTRY_ONDISK ||
+        reserved != 0u) {
+        return INDEX_INCOMPATIBLE;
+    }
+    if ((uint64_t)entry_count != table_row_count) {
+        return INDEX_CORRUPT;
+    }
+    if (!util_mul_u64((uint64_t)entry_count, (uint64_t)INDEX_ENTRY_ONDISK,
+                      &entries_size)) {
+        return INDEX_CORRUPT;
+    }
+    if (!util_add_u64((uint64_t)INDEX_HEADER_SIZE, entries_size, &expected_size)) {
+        return INDEX_CORRUPT;
+    }
+    if (expected_size != file_size) {
+        return INDEX_CORRUPT;
+    }
+
+    *out_entry_count = entry_count;
+    return INDEX_OK;
+}
+
 IndexStatus index_load(const char *table_name, Index **out) {
     char path[96];
     FILE *f = NULL;
     Index *index = NULL;
     Table *table = NULL;
     TableStatus table_status;
-    uint32_t magic, version, header_size, entry_size, entry_count, reserved;
+    uint32_t entry_count;
     uint32_t i;
     long file_size;
-    uint64_t entries_size;
-    uint64_t expected_size;
     IndexStatus result = INDEX_CORRUPT;
 
     if (out == NULL || !storage_valid_table_name(table_name) ||
@@ -307,11 +371,18 @@ IndexStatus index_load(const char *table_name, Index **out) {
     *out = NULL;
     table_status = storage_open_table_readonly(table_name, &table);
     if (table_status != TABLE_OK) {
-        return (table_status == TABLE_NOT_FOUND) ? INDEX_NOT_FOUND : INDEX_IO_ERROR;
+        if (table_status == TABLE_NOT_FOUND) {
+            return INDEX_NOT_FOUND;
+        }
+        return INDEX_IO_ERROR;
     }
     f = fopen(path, "rb");
     if (f == NULL) {
-        result = (errno == ENOENT) ? INDEX_NOT_FOUND : INDEX_IO_ERROR;
+        if (errno == ENOENT) {
+            result = INDEX_NOT_FOUND;
+        } else {
+            result = INDEX_IO_ERROR;
+        }
         goto done;
     }
     if (fseek(f, 0, SEEK_END) != 0 || (file_size = ftell(f)) < 0 ||
@@ -323,24 +394,12 @@ IndexStatus index_load(const char *table_name, Index **out) {
         result = INDEX_INCOMPATIBLE;
         goto done;
     }
-    if (!util_read_u32_le(f, &magic) || !util_read_u32_le(f, &version) ||
-        !util_read_u32_le(f, &header_size) || !util_read_u32_le(f, &entry_size) ||
-        !util_read_u32_le(f, &entry_count) || !util_read_u32_le(f, &reserved)) {
+
+    result = read_index_header(f, (uint64_t)file_size, table->row_count, &entry_count);
+    if (result != INDEX_OK) {
         goto done;
     }
-    if (magic != INDEX_MAGIC || version != INDEX_VERSION ||
-        header_size != INDEX_HEADER_SIZE || entry_size != INDEX_ENTRY_ONDISK ||
-        reserved != 0u) {
-        result = INDEX_INCOMPATIBLE;
-        goto done;
-    }
-    if ((uint64_t)entry_count != table->row_count ||
-        !util_mul_u64((uint64_t)entry_count, (uint64_t)INDEX_ENTRY_ONDISK,
-                      &entries_size) ||
-        !util_add_u64((uint64_t)INDEX_HEADER_SIZE, entries_size, &expected_size) ||
-        expected_size != (uint64_t)file_size) {
-        goto done;
-    }
+    result = INDEX_CORRUPT;
 #if SIZE_MAX < UINT32_MAX
     if (entry_count > (uint32_t)SIZE_MAX) {
         goto done;
@@ -384,12 +443,39 @@ done:
     return result;
 }
 
-IndexStatus index_rebuild_from_table(const char *table_path, const char *index_path) {
-    char table_name[SQL_TABLE_NAME_CAPACITY];
-    char derived_index[96];
+static bool table_name_from_path(const char *table_path, char *table_name,
+                                 size_t table_name_size) {
     const char *base;
     const char *slash;
     size_t length;
+
+    if (table_path == NULL || table_name == NULL || table_name_size == 0) {
+        return false;
+    }
+
+    slash = strrchr(table_path, '/');
+    if (slash == NULL) {
+        base = table_path;
+    } else {
+        base = slash + 1;
+    }
+
+    length = strlen(base);
+    if (length > 4u && strcmp(base + length - 4u, ".tbl") == 0) {
+        length -= 4u;
+    }
+    if (length == 0 || length >= table_name_size) {
+        return false;
+    }
+
+    memcpy(table_name, base, length);
+    table_name[length] = '\0';
+    return storage_valid_table_name(table_name);
+}
+
+IndexStatus index_rebuild_from_table(const char *table_path, const char *index_path) {
+    char table_name[SQL_TABLE_NAME_CAPACITY];
+    char derived_index[96];
     Table *table = NULL;
     Index *index = NULL;
     RowScanner scan;
@@ -398,30 +484,22 @@ IndexStatus index_rebuild_from_table(const char *table_path, const char *index_p
     ScanStatus scan_status;
     IndexStatus result;
 
-    if (table_path == NULL) {
-        return INDEX_ALLOC_ERROR;
-    }
-    slash = strrchr(table_path, '/');
-    base = (slash == NULL) ? table_path : slash + 1;
-    length = strlen(base);
-    if (length > 4u && strcmp(base + length - 4u, ".tbl") == 0) {
-        length -= 4u;
-    }
-    if (length == 0 || length >= sizeof(table_name)) {
-        return INDEX_ALLOC_ERROR;
-    }
-    memcpy(table_name, base, length);
-    table_name[length] = '\0';
-    if (!storage_valid_table_name(table_name)) {
+    if (!table_name_from_path(table_path, table_name, sizeof(table_name))) {
         return INDEX_ALLOC_ERROR;
     }
     {
         TableStatus status = storage_open_table_readonly(table_name, &table);
         if (status != TABLE_OK) {
-            return (status == TABLE_NOT_FOUND) ? INDEX_NOT_FOUND :
-                   (status == TABLE_ALLOC_ERROR) ? INDEX_ALLOC_ERROR :
-                   (status == TABLE_CORRUPT || status == TABLE_INCOMPATIBLE) ? INDEX_CORRUPT :
-                   INDEX_IO_ERROR;
+            if (status == TABLE_NOT_FOUND) {
+                return INDEX_NOT_FOUND;
+            }
+            if (status == TABLE_ALLOC_ERROR) {
+                return INDEX_ALLOC_ERROR;
+            }
+            if (status == TABLE_CORRUPT || status == TABLE_INCOMPATIBLE) {
+                return INDEX_CORRUPT;
+            }
+            return INDEX_IO_ERROR;
         }
     }
     if (table->row_count > (uint64_t)SIZE_MAX) {
@@ -448,7 +526,11 @@ IndexStatus index_rebuild_from_table(const char *table_path, const char *index_p
         }
     }
     if (scan_status != SCAN_END) {
-        result = (scan_status == SCAN_CORRUPT) ? INDEX_CORRUPT : INDEX_IO_ERROR;
+        if (scan_status == SCAN_CORRUPT) {
+            result = INDEX_CORRUPT;
+        } else {
+            result = INDEX_IO_ERROR;
+        }
         goto rebuild_done;
     }
     result = index_persist(index);
@@ -507,8 +589,11 @@ IndexStatus index_validate_lookup(Table *table, int32_t key, int64_t offset, Row
     uint64_t file_size;
     Row row;
     TableStatus status;
-    if (table == NULL || offset < 0) {
-        return (table == NULL) ? INDEX_IO_ERROR : INDEX_INVALID_OFFSET;
+    if (table == NULL) {
+        return INDEX_IO_ERROR;
+    }
+    if (offset < 0) {
+        return INDEX_INVALID_OFFSET;
     }
     if (storage_file_size(table, &file_size) != TABLE_OK ||
         !storage_is_valid_row_offset((uint64_t)offset, file_size, table->row_count)) {

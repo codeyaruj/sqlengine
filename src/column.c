@@ -20,9 +20,13 @@ ColumnType column_from_name(const char *name) {
 
 const char *column_type_name(ColumnType col) {
     switch (col) {
-        case COLUMN_ID: return "id";
-        case COLUMN_NAME: return "name";
-        case COLUMN_ALL: return "*";
-        default: return "<invalid>";
+        case COLUMN_ID:
+            return "id";
+        case COLUMN_NAME:
+            return "name";
+        case COLUMN_ALL:
+            return "*";
+        default:
+            return "<invalid>";
     }
 }

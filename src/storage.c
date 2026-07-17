@@ -218,7 +218,7 @@ bool storage_journal_path(const char *table_name, char *buf, size_t buflen) {
 bool storage_valid_table_name(const char *name) {
     size_t i;
     if (name == NULL || name[0] == '\0') {
-        return 0;
+        return false;
     }
     for (i = 0; name[i] != '\0'; i++) {
         unsigned char c = (unsigned char)name[i];
@@ -226,7 +226,7 @@ bool storage_valid_table_name(const char *name) {
                (c >= 'A' && c <= 'Z') ||
                (c >= '0' && c <= '9') ||
                c == '_' )) {
-            return 0;
+            return false;
         }
         if (i >= SQL_MAX_TABLE_NAME_LENGTH) {
             return false;
@@ -236,14 +236,12 @@ bool storage_valid_table_name(const char *name) {
 }
 
 static TableStatus write_header(FILE *f, uint64_t row_count) {
-    unsigned char pad[STORAGE_HEADER_SIZE];
-    size_t written;
+    unsigned char padding[STORAGE_HEADER_SIZE - 32u];
 
     if (fseek(f, 0, SEEK_SET) != 0) {
         return TABLE_IO_ERROR;
     }
 
-    memset(pad, 0, sizeof(pad));
     if (!util_write_u32_le(f, STORAGE_TABLE_MAGIC) ||
         !util_write_u32_le(f, STORAGE_TABLE_VERSION) ||
         !util_write_u32_le(f, STORAGE_HEADER_SIZE) ||
@@ -254,10 +252,8 @@ static TableStatus write_header(FILE *f, uint64_t row_count) {
         return TABLE_IO_ERROR;
     }
 
-    /* Header fields above are 32 bytes; zero-pad the rest. */
-    written = 32;
-    if (fwrite(pad + written, 1, STORAGE_HEADER_SIZE - written, f) !=
-        STORAGE_HEADER_SIZE - written) {
+    memset(padding, 0, sizeof(padding));
+    if (fwrite(padding, 1, sizeof(padding), f) != sizeof(padding)) {
         return TABLE_IO_ERROR;
     }
 
@@ -300,9 +296,13 @@ static uint64_t get_u64_le(const unsigned char *src) {
 static uint32_t journal_checksum(const unsigned char *bytes) {
     uint32_t hash = 2166136261u;
     size_t i;
+
     for (i = 0; i < JOURNAL_SIZE; i++) {
-        unsigned char byte = (i >= JOURNAL_CHECKSUM_AT && i < JOURNAL_CHECKSUM_AT + 4u)
-                           ? 0u : bytes[i];
+        unsigned char byte = bytes[i];
+
+        if (i >= JOURNAL_CHECKSUM_AT && i < JOURNAL_CHECKSUM_AT + 4u) {
+            byte = 0;
+        }
         hash ^= (uint32_t)byte;
         hash *= 16777619u;
     }
@@ -350,8 +350,10 @@ static TableStatus persist_insert_journal(const Table *table, const Row *row,
     put_u32_le(bytes + JOURNAL_CHECKSUM_AT, journal_checksum(bytes));
 
     if (!util_secure_temp_file(journal_path, temp_path, sizeof(temp_path), &fd)) {
-        return (errno == EACCES || errno == EROFS) ? TABLE_READ_ONLY :
-               TABLE_DURABILITY_ERROR;
+        if (errno == EACCES || errno == EROFS) {
+            return TABLE_READ_ONLY;
+        }
+        return TABLE_DURABILITY_ERROR;
     }
     f = fdopen(fd, "wb");
     if (f == NULL) {
@@ -378,8 +380,10 @@ static TableStatus persist_insert_journal(const Table *table, const Row *row,
         saved_errno = errno;
         unlink(temp_path);
         errno = saved_errno;
-        return (saved_errno == EACCES || saved_errno == EROFS) ? TABLE_READ_ONLY :
-               TABLE_DURABILITY_ERROR;
+        if (saved_errno == EACCES || saved_errno == EROFS) {
+            return TABLE_READ_ONLY;
+        }
+        return TABLE_DURABILITY_ERROR;
     }
     if (!util_sync_parent_directory(journal_path)) {
         return TABLE_DURABILITY_ERROR;
@@ -393,7 +397,8 @@ static TableStatus recover_insert_journal(FILE *table_file, const char *table_na
     char stored_name[SQL_TABLE_NAME_CAPACITY];
     uint32_t checksum;
     uint64_t previous_count;
-    uint64_t new_count;
+    uint64_t intended_count;
+    uint64_t expected_count;
     uint64_t offset;
     uint64_t expected_offset;
     uint64_t old_size;
@@ -413,7 +418,10 @@ static TableStatus recover_insert_journal(FILE *table_file, const char *table_na
         fd = open(journal_path, flags);
     }
     if (fd < 0) {
-        return (errno == ENOENT) ? TABLE_OK : TABLE_DURABILITY_ERROR;
+        if (errno == ENOENT) {
+            return TABLE_OK;
+        }
+        return TABLE_DURABILITY_ERROR;
     }
     amount = read(fd, bytes, sizeof(bytes));
     if (amount != (ssize_t)sizeof(bytes) || read(fd, &extra, 1) != 0) {
@@ -435,11 +443,11 @@ static TableStatus recover_insert_journal(FILE *table_file, const char *table_na
     memcpy(stored_name, bytes + 40, sizeof(stored_name));
     stored_name[sizeof(stored_name) - 1] = '\0';
     previous_count = get_u64_le(bytes + 16);
-    new_count = get_u64_le(bytes + 24);
+    intended_count = get_u64_le(bytes + 24);
     offset = get_u64_le(bytes + 32);
     if (strcmp(stored_name, table_name) != 0 ||
-        !util_add_u64(previous_count, 1, &new_count) ||
-        new_count != get_u64_le(bytes + 24) ||
+        !util_add_u64(previous_count, 1, &expected_count) ||
+        intended_count != expected_count ||
         !storage_offset_for_row(previous_count, &expected_offset) || expected_offset != offset ||
         !storage_logical_size(previous_count, &old_size)) {
         return TABLE_CORRUPT;
@@ -465,12 +473,7 @@ static TableStatus read_and_validate_header(FILE *f, uint64_t *row_count) {
     uint32_t magic, version, header_size, page_size, row_size, reserved0;
     uint64_t count;
     long file_size;
-    uint64_t min_size;
-    uint64_t expected_pages;
-    uint64_t rpp;
-    uint64_t full_pages;
-    uint64_t rem;
-    uint64_t expected_size;
+    uint64_t minimum_size;
 
     if (fseek(f, 0, SEEK_END) != 0) {
         return TABLE_IO_ERROR;
@@ -516,50 +519,11 @@ static TableStatus read_and_validate_header(FILE *f, uint64_t *row_count) {
         return TABLE_CORRUPT;
     }
 
-    /* Reject absurd counts (more than file could hold). */
-    rpp = (uint64_t)storage_rows_per_page();
-    if (rpp == 0) {
+    if (!storage_logical_size(count, &minimum_size)) {
         return TABLE_CORRUPT;
     }
-
-    min_size = (uint64_t)STORAGE_HEADER_SIZE;
-    if (count > 0) {
-        full_pages = (count - 1) / rpp;
-        rem = ((count - 1) % rpp) + 1;
-        /* File must cover full_pages complete pages + rem rows in last page. */
-        if (!util_mul_u64(full_pages, (uint64_t)STORAGE_PAGE_SIZE, &expected_pages)) {
-            return TABLE_CORRUPT;
-        }
-        if (!util_add_u64(min_size, expected_pages, &expected_size)) {
-            return TABLE_CORRUPT;
-        }
-        {
-            uint64_t last_bytes;
-            if (!util_mul_u64(rem, (uint64_t)STORAGE_ROW_SIZE, &last_bytes)) {
-                return TABLE_CORRUPT;
-            }
-            if (!util_add_u64(expected_size, last_bytes, &expected_size)) {
-                return TABLE_CORRUPT;
-            }
-        }
-        if ((uint64_t)file_size < expected_size) {
-            return TABLE_CORRUPT;
-        }
-    }
-
-    /* Cap: file cannot imply more rows than count without being corrupt later. */
-    {
-        uint64_t data_bytes = (uint64_t)file_size - (uint64_t)STORAGE_HEADER_SIZE;
-        uint64_t max_pages = data_bytes / (uint64_t)STORAGE_PAGE_SIZE;
-        uint64_t partial = data_bytes % (uint64_t)STORAGE_PAGE_SIZE;
-        uint64_t max_rows = max_pages * rpp + (partial / (uint64_t)STORAGE_ROW_SIZE);
-        /* Only complete slots in partial page count. */
-        if (partial / (uint64_t)STORAGE_ROW_SIZE > rpp) {
-            max_rows = max_pages * rpp + rpp;
-        }
-        if (count > max_rows) {
-            return TABLE_CORRUPT;
-        }
+    if ((uint64_t)file_size < minimum_size) {
+        return TABLE_CORRUPT;
     }
 
     *row_count = count;
@@ -589,7 +553,10 @@ TableCreateStatus storage_create_table(const char *table_name) {
 #endif
     fd = open(path, flags, S_IRUSR | S_IWUSR);
     if (fd < 0) {
-        return (errno == EEXIST) ? TABLE_CREATE_ALREADY_EXISTS : TABLE_CREATE_IO_ERROR;
+        if (errno == EEXIST) {
+            return TABLE_CREATE_ALREADY_EXISTS;
+        }
+        return TABLE_CREATE_IO_ERROR;
     }
     if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
         saved_errno = errno;
@@ -662,7 +629,11 @@ static TableStatus storage_open_table_mode(const char *table_name, int writable,
         free(table);
         return TABLE_IO_ERROR;
     }
-    flags = writable ? O_RDWR : O_RDONLY;
+    if (writable) {
+        flags = O_RDWR;
+    } else {
+        flags = O_RDONLY;
+    }
 #ifdef O_NOFOLLOW
     flags |= O_NOFOLLOW;
 #endif
@@ -678,7 +649,11 @@ static TableStatus storage_open_table_mode(const char *table_name, int writable,
         }
         return TABLE_IO_ERROR;
     }
-    table->file = fdopen(fd, writable ? "rb+" : "rb");
+    if (writable) {
+        table->file = fdopen(fd, "rb+");
+    } else {
+        table->file = fdopen(fd, "rb");
+    }
     if (table->file == NULL) {
         int open_errno = errno;
         close(fd);
@@ -751,6 +726,7 @@ TableStatus storage_insert_row(Table *table, const Row *row, uint64_t *out_offse
     unsigned char slot[STORAGE_ROW_SIZE];
     uint64_t new_count;
     char journal_path[128];
+    TableStatus journal_status;
 
     if (table == NULL || table->file == NULL || row == NULL) {
         return TABLE_IO_ERROR;
@@ -766,11 +742,9 @@ TableStatus storage_insert_row(Table *table, const Row *row, uint64_t *out_offse
 
     storage_serialize_row(row, slot);
 
-    {
-        TableStatus journal_status = persist_insert_journal(table, row, offset, new_count);
-        if (journal_status != TABLE_OK) {
-            return journal_status;
-        }
+    journal_status = persist_insert_journal(table, row, offset, new_count);
+    if (journal_status != TABLE_OK) {
+        return journal_status;
     }
     if (consume_storage_fault(STORAGE_FAULT_BEFORE_ROW_WRITE)) {
         return TABLE_IO_ERROR;
@@ -951,7 +925,10 @@ TableStatus storage_select_all_rows(Table *table, Row **rows, uint64_t *count) {
         }
         if (st != SCAN_OK) {
             free(arr);
-            return (st == SCAN_CORRUPT) ? TABLE_CORRUPT : TABLE_IO_ERROR;
+            if (st == SCAN_CORRUPT) {
+                return TABLE_CORRUPT;
+            }
+            return TABLE_IO_ERROR;
         }
         i++;
     }

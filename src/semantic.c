@@ -13,11 +13,12 @@ SemanticStatus semantic_validate(const AST *ast) {
     if (ast->type == AST_SELECT) {
         const SelectQuery *sel = &ast->query.select;
 
-        if (sel->select_all) {
-            /* * is valid */
-        } else {
+        if (!sel->select_all) {
             if (sel->column_count <= 0) {
                 return SEMANTIC_UNKNOWN_COLUMN;
+            }
+            if (sel->column_count > MAX_COLUMNS) {
+                return SEMANTIC_INVALID_VALUE;
             }
             for (i = 0; i < sel->column_count; i++) {
                 ColumnType col = column_from_name(sel->columns[i]);

@@ -416,6 +416,7 @@ static void test_parser_bounds_safe(void) {
 
 static void test_semantic_columns(void) {
     AST ast;
+    AST invalid_ast;
     test_begin("semantic column validation");
     ASSERT_EQ_INT(parse_sql("SELECT * FROM users;", &ast), PARSE_OK);
     ASSERT_EQ_INT(semantic_validate(&ast), SEMANTIC_OK);
@@ -429,6 +430,13 @@ static void test_semantic_columns(void) {
     ASSERT_EQ_INT(semantic_validate(&ast), SEMANTIC_TYPE_MISMATCH);
     ASSERT_EQ_INT(parse_sql("SELECT * FROM users WHERE name = 1;", &ast), PARSE_OK);
     ASSERT_EQ_INT(semantic_validate(&ast), SEMANTIC_TYPE_MISMATCH);
+
+    memset(&invalid_ast, 0, sizeof(invalid_ast));
+    invalid_ast.type = AST_SELECT;
+    invalid_ast.query.select.column_count = -1;
+    ASSERT_EQ_INT(semantic_validate(&invalid_ast), SEMANTIC_UNKNOWN_COLUMN);
+    invalid_ast.query.select.column_count = MAX_COLUMNS + 1;
+    ASSERT_EQ_INT(semantic_validate(&invalid_ast), SEMANTIC_INVALID_VALUE);
     test_end();
 }
 

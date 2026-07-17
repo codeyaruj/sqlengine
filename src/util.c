@@ -156,7 +156,11 @@ bool util_sync_parent_directory(const char *path) {
         directory[0] = '.';
         directory[1] = '\0';
     } else {
-        length = (slash == path) ? 1u : (size_t)(slash - path);
+        if (slash == path) {
+            length = 1;
+        } else {
+            length = (size_t)(slash - path);
+        }
         if (length >= sizeof(directory)) {
             errno = ENAMETOOLONG;
             return false;
@@ -204,18 +208,30 @@ bool util_print_escaped_field(FILE *out, const unsigned char *bytes, size_t size
     for (i = 0; i < end; i++) {
         unsigned char c = bytes[i];
         if (c == '\n') {
-            if (fputs("\\n", out) == EOF) return false;
+            if (fputs("\\n", out) == EOF) {
+                return false;
+            }
         } else if (c == '\r') {
-            if (fputs("\\r", out) == EOF) return false;
+            if (fputs("\\r", out) == EOF) {
+                return false;
+            }
         } else if (c == '\t') {
-            if (fputs("\\t", out) == EOF) return false;
+            if (fputs("\\t", out) == EOF) {
+                return false;
+            }
         } else if (c == '\\') {
-            if (fputs("\\\\", out) == EOF) return false;
+            if (fputs("\\\\", out) == EOF) {
+                return false;
+            }
         } else if (c == '"') {
-            if (fputs("\\\"", out) == EOF) return false;
+            if (fputs("\\\"", out) == EOF) {
+                return false;
+            }
         } else if (c < 0x20u || c == 0x7Fu || !isprint(c)) {
             char escaped[5] = {'\\', 'x', hex[c >> 4], hex[c & 0x0Fu], '\0'};
-            if (fputs(escaped, out) == EOF) return false;
+            if (fputs(escaped, out) == EOF) {
+                return false;
+            }
         } else if (fputc((int)c, out) == EOF) {
             return false;
         }

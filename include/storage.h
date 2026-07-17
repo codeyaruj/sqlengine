@@ -93,7 +93,7 @@ void storage_set_fault_point(StorageFaultPoint point);
 /* File size of open table (header + data). */
 TableStatus storage_file_size(Table *table, uint64_t *out_size);
 
-/* Compatibility aliases used by older call sites during transition. */
+/* Compatibility aliases used by older call sites. */
 #define PAGE_SIZE STORAGE_PAGE_SIZE
 #define NAME_SIZE STORAGE_NAME_SIZE
 

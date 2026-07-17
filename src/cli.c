@@ -29,73 +29,88 @@ static int is_sql_statement(const char *input) {
     return 0;
 }
 
+static void remove_trailing_semicolon(char *word) {
+    size_t length = strlen(word);
+
+    if (length > 0 && word[length - 1] == ';') {
+        word[length - 1] = '\0';
+    }
+}
+
+static void handle_create_table(const char *table_name) {
+    TableCreateStatus status;
+
+    if (table_name[0] == '\0') {
+        printf("Usage: create_table <table_name>\n");
+        return;
+    }
+
+    status = storage_create_table(table_name);
+    if (status == TABLE_CREATE_OK) {
+        printf("Table '%s' created successfully.\n", table_name);
+    } else if (status == TABLE_CREATE_ALREADY_EXISTS) {
+        printf("Table '%s' already exists.\n", table_name);
+    } else if (status == TABLE_CREATE_INVALID_NAME) {
+        printf("Error: Invalid table name '%s'.\n", table_name);
+    } else if (status == TABLE_CREATE_NAME_TOO_LONG) {
+        printf("Error: Table name '%s' is too long (maximum %u bytes).\n",
+               table_name, (unsigned int)SQL_MAX_TABLE_NAME_LENGTH);
+    } else {
+        printf("Error: Could not create table '%s' (%s).\n",
+               table_name, table_create_status_string(status));
+    }
+}
+
+static void handle_rebuild_index(const char *table_name) {
+    IndexStatus status;
+
+    if (table_name[0] == '\0') {
+        printf("Usage: rebuild_index <table_name>\n");
+        return;
+    }
+
+    status = index_rebuild(table_name);
+    if (status == INDEX_OK) {
+        printf("Index for '%s' rebuilt successfully.\n", table_name);
+    } else {
+        printf("Error: Could not rebuild index for '%s' (%s).\n",
+               table_name, index_status_string(status));
+    }
+}
+
+static void print_help(void) {
+    printf("SQL Engine CLI\n");
+    printf("\nSQL (keywords are case-insensitive):\n");
+    printf("  SELECT * FROM <table>;\n");
+    printf("  SELECT id, name FROM <table> WHERE id = <n>;\n");
+    printf("  SELECT * FROM <table> WHERE name = \"value\";\n");
+    printf("  INSERT INTO <table> VALUES (<id>, \"name\");\n");
+    printf("\nMeta commands:\n");
+    printf("  create_table <name>    Create a new table\n");
+    printf("  rebuild_index <name>   Rebuild index from table data\n");
+    printf("  help                   Show this help\n");
+    printf("  exit, quit             Exit the CLI\n");
+    printf("\nSchema: columns id (unique int32 primary key), name (string, max 31 chars).\n");
+}
+
 static void handle_meta_command(const char *input) {
-    char cmd[64] = {0};
-    char arg[64] = {0};
-    size_t cmd_len;
-    size_t arg_len;
+    char command[64] = {0};
+    char argument[64] = {0};
 
-    sscanf(input, "%63s %63s", cmd, arg);
+    (void)sscanf(input, "%63s %63s", command, argument);
+    remove_trailing_semicolon(command);
+    remove_trailing_semicolon(argument);
 
-    cmd_len = strlen(cmd);
-    if (cmd_len > 0 && cmd[cmd_len - 1] == ';') {
-        cmd[cmd_len - 1] = '\0';
-    }
-    arg_len = strlen(arg);
-    if (arg_len > 0 && arg[arg_len - 1] == ';') {
-        arg[arg_len - 1] = '\0';
-    }
-
-    if (strcmp(cmd, "create_table") == 0) {
-        TableCreateStatus st;
-        if (arg[0] == '\0') {
-            printf("Usage: create_table <table_name>\n");
-            return;
-        }
-        st = storage_create_table(arg);
-        if (st == TABLE_CREATE_OK) {
-            printf("Table '%s' created successfully.\n", arg);
-        } else if (st == TABLE_CREATE_ALREADY_EXISTS) {
-            printf("Table '%s' already exists.\n", arg);
-        } else if (st == TABLE_CREATE_INVALID_NAME) {
-            printf("Error: Invalid table name '%s'.\n", arg);
-        } else if (st == TABLE_CREATE_NAME_TOO_LONG) {
-            printf("Error: Table name '%s' is too long (maximum %u bytes).\n",
-                   arg, (unsigned int)SQL_MAX_TABLE_NAME_LENGTH);
-        } else {
-            printf("Error: Could not create table '%s' (%s).\n",
-                   arg, table_create_status_string(st));
-        }
-    } else if (strcmp(cmd, "rebuild_index") == 0) {
-        IndexStatus st;
-        if (arg[0] == '\0') {
-            printf("Usage: rebuild_index <table_name>\n");
-            return;
-        }
-        st = index_rebuild(arg);
-        if (st == INDEX_OK) {
-            printf("Index for '%s' rebuilt successfully.\n", arg);
-        } else {
-            printf("Error: Could not rebuild index for '%s' (%s).\n",
-                   arg, index_status_string(st));
-        }
-    } else if (strcmp(cmd, "help") == 0) {
-        printf("SQL Engine CLI\n");
-        printf("\nSQL (keywords are case-insensitive):\n");
-        printf("  SELECT * FROM <table>;\n");
-        printf("  SELECT id, name FROM <table> WHERE id = <n>;\n");
-        printf("  SELECT * FROM <table> WHERE name = \"value\";\n");
-        printf("  INSERT INTO <table> VALUES (<id>, \"name\");\n");
-        printf("\nMeta commands:\n");
-        printf("  create_table <name>    Create a new table\n");
-        printf("  rebuild_index <name>   Rebuild index from table data\n");
-        printf("  help                   Show this help\n");
-        printf("  exit, quit             Exit the CLI\n");
-        printf("\nSchema: columns id (unique int32 primary key), name (string, max 31 chars).\n");
-    } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
+    if (strcmp(command, "create_table") == 0) {
+        handle_create_table(argument);
+    } else if (strcmp(command, "rebuild_index") == 0) {
+        handle_rebuild_index(argument);
+    } else if (strcmp(command, "help") == 0) {
+        print_help();
+    } else if (strcmp(command, "exit") == 0 || strcmp(command, "quit") == 0) {
         exit(0);
     } else {
-        printf("Unknown command: %s\n", cmd);
+        printf("Unknown command: %s\n", command);
         printf("Type 'help' for available commands.\n");
     }
 }
@@ -103,14 +118,14 @@ static void handle_meta_command(const char *input) {
 static int handle_sql_input(const char *input) {
     Token token_storage[MAX_TOKENS];
     TokenBuffer tokens = { NULL, 0 };
-    TokenizeStatus tstat;
-    ParseStatus pstat;
+    TokenizeStatus tokenize_status;
+    ParseStatus parse_status;
     AST ast;
-    ExecStatus estat;
+    ExecStatus execute_status;
 
-    tstat = tokenize(input, token_storage, MAX_TOKENS, &tokens);
-    if (tstat != TOKENIZE_OK) {
-        printf("Error: Tokenizer: %s.\n", tokenize_status_string(tstat));
+    tokenize_status = tokenize(input, token_storage, MAX_TOKENS, &tokens);
+    if (tokenize_status != TOKENIZE_OK) {
+        printf("Error: Tokenizer: %s.\n", tokenize_status_string(tokenize_status));
         return -1;
     }
 
@@ -118,20 +133,23 @@ static int handle_sql_input(const char *input) {
         return 0;
     }
 
-    pstat = parse_tokens(tokens, &ast);
-    if (pstat != PARSE_OK) {
-        printf("Error: Parser: %s.\n", parse_status_string(pstat));
+    parse_status = parse_tokens(tokens, &ast);
+    if (parse_status != PARSE_OK) {
+        printf("Error: Parser: %s.\n", parse_status_string(parse_status));
         return -1;
     }
 
-    estat = execute(&ast);
+    execute_status = execute(&ast);
     ast_free(&ast);
-    return (estat == EXEC_OK) ? 0 : -1;
+    if (execute_status == EXEC_OK) {
+        return 0;
+    }
+    return -1;
 }
 
 int cli_read_line(FILE *stream, char *buf, size_t buflen) {
-    size_t len;
-    int c;
+    size_t length;
+    int character;
 
     if (stream == NULL || buf == NULL || buflen < 2) {
         return -1;
@@ -141,22 +159,22 @@ int cli_read_line(FILE *stream, char *buf, size_t buflen) {
         return -1;
     }
 
-    len = strlen(buf);
-    if (len > 0 && buf[len - 1] == '\n') {
-        buf[len - 1] = '\0';
+    length = strlen(buf);
+    if (length > 0 && buf[length - 1] == '\n') {
+        buf[length - 1] = '\0';
         return 0;
     }
 
     /* No newline: either EOF without newline, or line longer than buffer. */
-    c = fgetc(stream);
-    if (c == EOF) {
+    character = fgetc(stream);
+    if (character == EOF) {
         /* Last line without newline — treat as complete. */
         return 0;
     }
 
     /* Oversized: discard rest of line. */
-    while (c != '\n' && c != EOF) {
-        c = fgetc(stream);
+    while (character != '\n' && character != EOF) {
+        character = fgetc(stream);
     }
     buf[0] = '\0';
     return -2;
@@ -174,36 +192,37 @@ int cli_handle_line(const char *input) {
     }
 
     if (!is_sql_statement(input)) {
-        char cmd[64] = {0};
-        sscanf(input, "%63s", cmd);
-        {
-            size_t n = strlen(cmd);
-            if (n > 0 && cmd[n - 1] == ';') {
-                cmd[n - 1] = '\0';
-            }
-        }
-        if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
+        char command[64] = {0};
+
+        (void)sscanf(input, "%63s", command);
+        remove_trailing_semicolon(command);
+        if (strcmp(command, "exit") == 0 || strcmp(command, "quit") == 0) {
             return 1;
         }
         handle_meta_command(input);
         return 0;
     }
 
-    handle_sql_input(input);
+    (void)handle_sql_input(input);
     return 0;
 }
 
 void cli_run(void) {
     char input[CLI_MAX_INPUT];
-    int rc;
+    int result;
 
     printf("SQL Engine CLI\n");
     printf("Type 'help' for available commands.\n");
     printf("> ");
     fflush(stdout);
 
-    while ((rc = cli_read_line(stdin, input, sizeof(input))) != -1) {
-        if (rc == -2) {
+    while (1) {
+        result = cli_read_line(stdin, input, sizeof(input));
+        if (result == -1) {
+            break;
+        }
+
+        if (result == -2) {
             printf("Error: Input too long (maximum %d characters per line).\n",
                    CLI_MAX_INPUT - 1);
             printf("> ");

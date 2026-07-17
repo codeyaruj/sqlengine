@@ -69,6 +69,13 @@ bool parser_expect(Parser *p, TokenType type) {
     return false;
 }
 
+static ParseStatus missing_token_status(const Parser *p) {
+    if (parser_at_end(p)) {
+        return PARSE_UNEXPECTED_EOF;
+    }
+    return PARSE_ERROR;
+}
+
 static ParseStatus parse_select(Parser *p, AST *ast) {
     SelectQuery *sel = &ast->query.select;
 
@@ -97,7 +104,7 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
 
         while (parser_match(p, TOKEN_COMMA)) {
             if (!parser_check(p, TOKEN_IDENTIFIER)) {
-                return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+                return missing_token_status(p);
             }
             if (sel->column_count >= MAX_COLUMNS) {
                 return PARSE_ERROR;
@@ -111,15 +118,15 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
             parser_advance(p);
         }
     } else {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
 
     if (!parser_expect(p, TOKEN_FROM)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
 
     if (!parser_check(p, TOKEN_IDENTIFIER)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
     if (!util_copy_checked(sel->table_name, sizeof(sel->table_name), parser_peek(p)->value)) {
         return PARSE_TABLE_NAME_TOO_LONG;
@@ -130,7 +137,7 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
         sel->has_where = 1;
 
         if (!parser_check(p, TOKEN_IDENTIFIER)) {
-            return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+            return missing_token_status(p);
         }
         if (!util_copy_checked(sel->where_column, sizeof(sel->where_column),
                                parser_peek(p)->value)) {
@@ -139,7 +146,7 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
         parser_advance(p);
 
         if (!parser_expect(p, TOKEN_EQUAL)) {
-            return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+            return missing_token_status(p);
         }
 
         if (parser_check(p, TOKEN_NUMBER)) {
@@ -157,12 +164,12 @@ static ParseStatus parse_select(Parser *p, AST *ast) {
             }
             parser_advance(p);
         } else {
-            return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+            return missing_token_status(p);
         }
     }
 
     if (!parser_expect(p, TOKEN_SEMICOLON)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
 
     if (!parser_at_end(p)) {
@@ -183,11 +190,11 @@ static ParseStatus parse_insert(Parser *p, AST *ast) {
         return PARSE_ERROR;
     }
     if (!parser_expect(p, TOKEN_INTO)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
 
     if (!parser_check(p, TOKEN_IDENTIFIER)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
     if (!util_copy_checked(ins->table_name, sizeof(ins->table_name), parser_peek(p)->value)) {
         return PARSE_TABLE_NAME_TOO_LONG;
@@ -195,14 +202,14 @@ static ParseStatus parse_insert(Parser *p, AST *ast) {
     parser_advance(p);
 
     if (!parser_expect(p, TOKEN_VALUES)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
     if (!parser_expect(p, TOKEN_LPAREN)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
 
     if (!parser_check(p, TOKEN_NUMBER)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
     if (!util_parse_int32(parser_peek(p)->value, &id)) {
         return PARSE_INTEGER_OUT_OF_RANGE;
@@ -211,11 +218,11 @@ static ParseStatus parse_insert(Parser *p, AST *ast) {
     parser_advance(p);
 
     if (!parser_expect(p, TOKEN_COMMA)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
 
     if (!parser_check(p, TOKEN_STRING)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
     if (!util_copy_checked(ins->name, sizeof(ins->name), parser_peek(p)->value)) {
         return PARSE_STRING_TOO_LONG;
@@ -223,10 +230,10 @@ static ParseStatus parse_insert(Parser *p, AST *ast) {
     parser_advance(p);
 
     if (!parser_expect(p, TOKEN_RPAREN)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
     if (!parser_expect(p, TOKEN_SEMICOLON)) {
-        return parser_at_end(p) ? PARSE_UNEXPECTED_EOF : PARSE_ERROR;
+        return missing_token_status(p);
     }
 
     if (!parser_at_end(p)) {
